@@ -11,21 +11,21 @@
 //!   ports/servoshell/desktop/keyutils.rs         (key translation)
 //!   components/shared/embedder/input_events.rs  (event constructors)
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 
 use euclid::Scale;
 use log::{error, info};
 use servo::{
-    Code, EventLoopWaker, InputEvent, KeyboardEvent, Key, KeyState, Location, Modifiers,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey, RenderingContext,
-    Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode, WindowRenderingContext,
+    Code, DevicePoint, EventLoopWaker, InputEvent, KeyboardEvent, Key, KeyState, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
+    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalPosition;
+use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState};
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new(&event_loop);
-    event_loop.run_app(&mut app)
+    Ok(event_loop.run_app(&mut app)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -57,10 +57,14 @@ struct AppState {
     /// Boxed because a WebView has no useful Default; one webview for now.
     webview: RefCell<Option<WebView>>,
     /// Wheel events need a position; winit reports deltas without one.
-    last_pointer: LogicalPosition<f64>,
+    last_pointer: Cell<PhysicalPosition<f64>>,
     /// winit reports modifier state separately from key events, so it has to be
     /// tracked or Shift/Ctrl would never reach the page.
-    modifiers: ModifiersState,
+    ///
+    /// `Cell` because `AppState` lives in an `Rc` shared with the delegate, which
+    /// Servo requires to be `Rc<dyn WebViewDelegate>`; plain fields would be
+    /// immutable through that handle.
+    modifiers: Cell<ModifiersState>,
 }
 
 /// The single delegate. Servo calls this when a frame is ready; the only thing
@@ -120,8 +124,8 @@ impl ApplicationHandler<WakerEvent> for App {
             servo,
             rendering_context,
             webview: RefCell::new(None),
-            last_pointer: LogicalPosition::new(0.0, 0.0),
-            modifiers: ModifiersState::default(),
+            last_pointer: Cell::new(PhysicalPosition::new(0.0, 0.0)),
+            modifiers: Cell::new(ModifiersState::default()),
         });
 
         let url = Url::parse(START_URL).expect("START_URL must be a valid URL");
@@ -169,41 +173,42 @@ impl ApplicationHandler<WakerEvent> for App {
             }
             WindowEvent::RedrawRequested => redraw = true,
             WindowEvent::ModifiersChanged(changed) => {
-                state.modifiers = changed.state();
+                state.modifiers.set(changed.state());
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // Deliver immediately. Hover effects (and the cursor changing to
                 // a hand over a link) depend on Servo receiving these even when
                 // no new frame is pending, so tying this to `redraw` would
                 // break the cursor entirely.
-                state.last_pointer = position;
+                state.last_pointer.set(position);
                 let point = page_point(position);
                 if let Some(webview) = state.webview.borrow().as_ref() {
                     let _ =
                         webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
                 }
             }
-            WindowEvent::MouseInput { state: button, button, .. } => {
+            WindowEvent::MouseInput { state: button_state, button, .. } => {
                 if let Some(webview) = state.webview.borrow().as_ref() {
                     let _ = webview.notify_input_event(InputEvent::MouseButton(
                         MouseButtonEvent::new(
-                            if button == ElementState::Pressed {
+                            if button_state == ElementState::Pressed {
                                 MouseButtonAction::Down
                             } else {
                                 MouseButtonAction::Up
                             },
                             mouse_button(button),
-                            page_point(state.last_pointer),
+                            page_point(state.last_pointer.get()),
                         ),
                     ));
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(webview) = state.webview.borrow().as_ref() {
+                    // winit 0.30 yields f32 line deltas, but Servo's WheelDelta carries f64.
                     let (x, y, mode) = match delta {
                         MouseScrollDelta::LineDelta(dx, dy) => (
-                            dx * SCROLL_LINE_HEIGHT,
-                            dy * SCROLL_LINE_HEIGHT,
+                            f64::from(dx) * SCROLL_LINE_HEIGHT,
+                            f64::from(dy) * SCROLL_LINE_HEIGHT,
                             WheelMode::DeltaLine,
                         ),
                         MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
@@ -215,12 +220,12 @@ impl ApplicationHandler<WakerEvent> for App {
                             z: 0.0,
                             mode,
                         },
-                        page_point(state.last_pointer),
+                        page_point(state.last_pointer.get()),
                     )));
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let modifiers = state.modifiers;
+                let modifiers = state.modifiers.get();
                 if let Some(webview) = state.webview.borrow().as_ref() {
                     let _ =
                         webview.notify_input_event(InputEvent::Keyboard(keyboard_event(&event, modifiers)));
@@ -245,14 +250,21 @@ impl ApplicationHandler<WakerEvent> for App {
 // Input translation
 // ---------------------------------------------------------------------------
 
-fn page_point(position: LogicalPosition<f64>) -> WebViewPoint {
-    // The spike has no browser chrome, so window coordinates and page
-    // coordinates are the same. This stops being true the moment a toolbar is
-    // added — see docs/architecture-research.md section 8.
-    WebViewPoint::Page(euclid::Point2D::new(
-        position.x as f32,
-        position.y as f32,
-    ))
+/// Converts a winit cursor position into a point Servo accepts.
+///
+/// Device pixels relative to the WebView origin, matching servoshell
+/// (`desktop/geometry.rs:13` and `headed_window.rs:326`, which passes
+/// `point.into()`). Using `WebViewPoint::Page` here would be wrong: page
+/// coordinates are CSS pixels after page-zoom and pinch-zoom scaling, and are
+/// only equal to window coordinates in the degenerate case of no chrome and
+/// zoom 1.0. When a toolbar is added this must additionally subtract the chrome
+/// height, exactly as `headed_window.rs:300-301` does.
+///
+/// The variant is named explicitly rather than using `.into()`: Servo provides
+/// two `From<Point2D<f32, _>>` impls for `WebViewPoint` (CSSPixel and
+/// DevicePixel), so inference alone is ambiguous.
+fn page_point(position: PhysicalPosition<f64>) -> WebViewPoint {
+    WebViewPoint::Device(DevicePoint::new(position.x as f32, position.y as f32))
 }
 
 fn mouse_button(button: WinitMouseButton) -> MouseButton {

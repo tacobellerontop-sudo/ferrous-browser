@@ -411,3 +411,65 @@ SpiderMonkey (`mozjs_sys v153.3.0`) compiled successfully — the single largest
 unknown is resolved. ANGLE's C++ compile is running inside mozangle's build
 script right now. 566 crates, **0 errors**. `browser/Cargo.lock` now exists,
 which the CI workflow pins via `--locked`.
+
+---
+
+## 2026-09-29 — Entry 004: MILESTONE 1 ACHIEVED
+
+### Outcome
+
+The spike compiles, runs, and renders real web content on this machine.
+
+| Milestone 1 criterion | Status | Evidence |
+| --- | --- | --- |
+| Application launches | PASS | process starts, 57 threads |
+| Window opens | PASS | titled "Ferrous spike" |
+| Servo initializes | PASS | no panics, no stderr |
+| A webpage loads | PASS | `https://servo.org` over TLS |
+| **Page renders** | **PASS** | screenshot: SVG logo, text, CSS-styled buttons — not a blank frame |
+| **Mouse input** | **PASS** | synthetic click navigated to the Contributing page |
+| Keyboard input | **UNVERIFIED** | no text input on the test page; not yet exercised |
+
+Build: 117.8 MB executable, 450 MB PDB, 186 MB working set at idle-with-a-page.
+
+### Compile errors hit in our own crate (10, all in the 346-line spike)
+
+The engine compiled clean first time. All errors were in code we wrote:
+
+1. **Double-bound pattern binding.** `WindowEvent::MouseInput { state: button, button, .. }`
+   bound `button` twice (E0416).
+2. **Wrong coordinates for `WebViewPoint`.** Used `WebViewPoint::Page`, which is
+   *CSS pixels after page-zoom and pinch-zoom* — only equal to window coordinates
+   in the degenerate case of no chrome and zoom 1.0. Corrected to
+   `WebViewPoint::Device`, matching servoshell (`geometry.rs:13`,
+   `headed_window.rs:326`).
+3. **`CursorMoved` yields `PhysicalPosition<f64>`** in winit 0.30, not logical.
+4. **`run_app` returns `Result<(), EventLoopError>`**, not `Box<dyn Error>`.
+5. **Scroll type mismatch.** winit line deltas are `f32`; Servo's `WheelDelta` is
+   `f64`.
+6. **Ambiguous `.into()`.** Servo provides *two* `From<Point2D<f32, _>>` impls for
+   `WebViewPoint` (CSSPixel and DevicePixel), so inference fails (E0283). Now
+   spelled explicitly.
+7. **`Rc` is read-only.** `last_pointer` and `modifiers` needed `Cell` because
+   `AppState` is shared with the delegate as `Rc<dyn WebViewDelegate>` (E0594).
+8. **Pattern shadowing.** Renaming `state: button` to `state` shadowed the outer
+   `Rc<AppState>` inside the match arm (E0609).
+
+The most valuable of these is #2: `Page` vs `Device` is a silent correctness bug,
+not a compile error, and it would have broken hit-testing the instant browser
+chrome was added.
+
+### P19 confirmed empirically
+
+`scripts/copy-angle-dlls.ps1` found the ANGLE DLLs in
+`target/medium/build/mozangle-56c8504a11462356/out/` — present but **not** beside
+the executable. Without the copy step the binary would have failed to start with
+a missing-DLL error. This is now a hard prerequisite, enforced in CI.
+
+### What is still unproven
+
+- Keyboard input (needs a page with a text field).
+- Resize handling under real user resize.
+- Whether cross-process paint works when embedded (still defaulting to
+  single-process via `Opts::default()`).
+- Anything at all about tabs, chrome, or navigation UI.
