@@ -132,13 +132,18 @@ impl Chrome {
             self.focus_address_bar_next_frame = false;
         }
 
-        // Enter submits. Checked globally rather than on the TextEdit response
-        // because a keypress that submits usually also mutates the text, and
-        // relying on `changed()` alone misses Enter on an unchanged box.
+        // Enter submits.
+        //
+        // The submit condition is `lost_focus()`, NOT `has_focus()`. A singleline
+        // TextEdit deliberately surrenders focus when Enter is pressed
+        // (egui-0.34.3/src/widgets/text_edit/builder.rs:108), so by the time
+        // this frame runs, `has_focus()` is already false. Testing `focused &&
+        // enter` therefore never fires — which is exactly why typing in the
+        // address bar appeared to do nothing. egui documents the correct
+        // idiom at builder.rs:35.
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if focused && enter && !text.trim().is_empty() {
+        if response.lost_focus() && enter && !text.trim().is_empty() {
             actions.push(Action::Navigate(text.trim().to_owned()));
-            response.request_focus(); // keep focus so the next keystroke replaces
         }
     }
 }

@@ -577,3 +577,84 @@ each variant, `address::resolve` is unit tested) but "wired" is not "verified".
 An earlier observation that the address bar appeared focused at startup was an
 artifact of my own test clicks, not a bug: instrumented logs show
 `address_focused=false` in normal operation.
+
+---
+
+## 2026-09-30 — Entry 006: Fix address bar (user-reported)
+
+### Symptom
+
+User reported the search bar did not work, while reload and the back/forward
+buttons did.
+
+### Root cause
+
+The submit condition was inverted. `chrome.rs` had:
+
+```rust
+if focused && enter && !text.trim().is_empty() { /* navigate */ }
+```
+
+A **singleline** egui `TextEdit` deliberately surrenders focus when Enter is
+pressed — `egui-0.34.3/src/widgets/text_edit/builder.rs:108`:
+
+> No newlines (`\n`) allowed. Pressing enter key will result in the
+> `TextEdit` losing focus (`response.lost_focus`).
+
+So by the time the frame ran, `response.has_focus()` was already `false`, and
+`focused && enter` could never be true. Enter did reach egui and did blur the
+box; the navigation branch was simply unreachable.
+
+egui documents the correct idiom at `builder.rs:35`:
+
+```rust
+if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { /* .. */ }
+```
+
+Fixed to `if response.lost_focus() && enter && ...`.
+
+**General lesson:** for widgets that react to a key by surrendering focus, the
+submit signal is "lost focus this frame", not "has focus". Checking focus *after*
+the widget has processed the key is a race with itself.
+
+### How it was found
+
+Not by reading. Instrumented `address_bar` to log
+`rect / focused / lost_focus / enter / text` every frame, which immediately
+showed `focused=false enter=false` after Enter — and, crucially, showed Enter was
+being received at all. That ruled out input-injection problems and pointed at the
+condition itself.
+
+Two input-injection problems were also ruled out along the way, so as not to
+chase them later:
+
+- A hand-rolled `SendInput` `INPUT` struct with the union at offset 0. On x64
+  Windows the union sits at **offset 8**; with the wrong layout nothing is
+  delivered at all and the app simply draws no new frames.
+- `keybd_event` with `[byte][char]'.'` (0x2E) is **VK_DOWN**, not a period, so
+  injected URLs silently lose their dots. Only affects test harnesses.
+
+### Verified after the fix
+
+Screenshot shows the full DuckDuckGo results page for `examplecom`, with the
+address bar reading `https://duckduckgo.com/?q=examplecom&ia=web`, and the
+back/forward buttons now **enabled** — confirming `notify_history_changed` is
+driving toolbar state correctly.
+
+Also confirmed: `address::resolve` classified a bare word as a search query and
+redirected to the search endpoint, while `https://…` input passes through as a
+URL. That split is unit tested.
+
+### Milestone 2 status
+
+| Feature | Status |
+| --- | --- |
+| Toolbar renders over the page | verified |
+| Reload | verified by user |
+| Back / forward | verified by user |
+| Address bar: accept input | verified |
+| Address bar: Enter navigates | verified (this fix) |
+| Search queries -> DuckDuckGo | verified |
+| URL passthrough (typed URL) | unit tested, not clicked by hand |
+| Keyboard reaching page content | still unverified |
+| Resize handling | still unverified |
