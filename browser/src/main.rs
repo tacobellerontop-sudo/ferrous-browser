@@ -31,14 +31,13 @@ use egui_glow::EguiGlow;
 use euclid::{Point2D as EuclidPoint, Rect as EuclidRect, Size2D as EuclidSize};
 use log::{error, info};
 use servo::{
-    Code, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, Location,
-    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
-    OffscreenRenderingContext, RenderingContext, Scroll, WebViewPoint, WebViewVector,
-    WindowRenderingContext,
+    DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, OffscreenRenderingContext, RenderingContext, Scroll, WebViewPoint,
+    WebViewVector, WindowRenderingContext,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey};
@@ -50,17 +49,18 @@ mod browser_state;
 mod chrome;
 mod engine;
 mod icons;
+mod input;
 mod prefs;
 mod scroll;
+mod tab;
 mod titlebar;
 
 use browser_state::BrowserState;
 use chrome::{Action, Chrome};
-use engine::Engine;
+use engine::WebEngine;
+use input::{SCROLL_LINE_HEIGHT, keyboard_event, mouse_button, page_point, window_point};
 use scroll::SmoothScroll;
-
-/// servoshell uses the same value (ports/servoshell/window.rs:25-27).
-const SCROLL_LINE_HEIGHT: f64 = 76.0;
+use tab::{CloseOutcome, TabId};
 
 const START_URL: &str = "https://servo.org";
 
@@ -86,7 +86,8 @@ struct AppState {
     egui: EguiGlow,
     chrome: Chrome,
     state: Rc<BrowserState>,
-    engine: Engine,
+    /// Owns the Servo runtime and one web view per tab.
+    engine: WebEngine,
     modifiers: Cell<ModifiersState>,
     /// Last title pushed to the OS window. Guarding on this avoids calling
     /// `SetWindowText` on every single frame, which is a syscall per frame.
@@ -117,10 +118,15 @@ struct AppState {
     /// Cursor position in egui points within the window, used only for the
     /// frameless resize-border hit test.
     cursor: Cell<Option<egui::Pos2>>,
-    /// Last URL observed by the frame loop, so a navigation can be detected from
-    /// one string comparison instead of threading a flag from every navigation
-    /// site (toolbar, link click, redirect, history).
-    seen_url: RefCell<String>,
+    /// Last (url, active tab) observed by the frame loop, or `None` before the
+    /// first frame, so a navigation or tab switch can be detected from one
+    /// comparison instead of threading a flag from every navigation site
+    /// (toolbar, link click, redirect, history).
+    seen_url: RefCell<Option<(String, TabId)>>,
+    /// Set when the last tab is closed from a shortcut. `handle_shortcut` has no
+    /// access to the `ActiveEventLoop` that owns exiting, so the request is
+    /// carried up to `window_event`.
+    close_requested: Cell<bool>,
 }
 
 enum App {
@@ -183,12 +189,20 @@ impl ApplicationHandler<WakerEvent> for App {
         let egui = EguiGlow::new(event_loop, offscreen_ctx.glow_gl_api(), None, None, false);
 
         let state = Rc::new(BrowserState::default());
-        let engine = Engine::new(
+        let engine = WebEngine::new(
             offscreen_ctx.clone(),
             window.clone(),
             state.clone(),
             Box::new(waker.clone()),
+        );
+
+        // The first tab. Its id comes from the tab model, which is the single
+        // source of truth for identity; the engine is told about it afterwards.
+        let first = state.tabs_mut().create(START_URL);
+        engine.open_tab(
+            first,
             Url::parse(START_URL).expect("START_URL must be valid"),
+            true,
         );
 
         info!("ferrous: started");
@@ -210,7 +224,8 @@ impl ApplicationHandler<WakerEvent> for App {
             maximized: Cell::new(false),
             modal_gesture: Cell::new(false),
             cursor: Cell::new(None),
-            seen_url: RefCell::new(String::new()),
+            seen_url: RefCell::new(None),
+            close_requested: Cell::new(false),
         }));
     }
 
@@ -244,7 +259,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 return;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                app.cursor.set(Some(to_window_points(app, position)));
+                app.cursor.set(Some(window_point(position, app.egui.egui_ctx.pixels_per_point())));
             }
             // The user can maximise or restore from outside our buttons (Win+Up,
             // dragging the window to a screen edge, double-clicking the bar), so
@@ -289,6 +304,12 @@ impl ApplicationHandler<WakerEvent> for App {
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
             if handle_shortcut(app, key, app.modifiers.get()) {
                 app.engine.spin();
+                // Closing the last tab is a shutdown request, but only
+                // `window_event` holds the `ActiveEventLoop` that can exit.
+                if app.close_requested.replace(false) {
+                    event_loop.exit();
+                    return;
+                }
                 return;
             }
         }
@@ -327,12 +348,29 @@ fn draw_frame(app: &mut AppState) -> bool {
     let dt = now.duration_since(app.frame_started);
     app.frame_started = now;
 
+    // Apply engine callbacks before anything reads the tab model. This is the
+    // only place the queue is drained, which is what makes it safe: no
+    // `RefCell` borrow of the tab set is live at this point, so a callback that
+    // arrives mid-frame cannot panic.
+    app.state.drain_events();
+
     // Title-bar commands are collected during the frame but executed *after*
     // `present()`. `SendMessageW(WM_NCLBUTTONDOWN, ...)` opens a modal Windows
     // drag loop that blocks until the gesture ends; running it inside the egui
     // closure would re-enter the event loop with egui's borrow stack half
     // unwound.
     let mut window_commands: Vec<titlebar::WindowCommand> = Vec::new();
+    // Set when a chrome action closes the last tab. Declared out here because the
+    // egui closure below is what sets it and the code after `present()` reads it.
+    let mut close_window = false;
+
+    // `Tabs::active()` indexes directly and would panic on an empty set. Closing
+    // the last tab is supposed to shut the window down before another frame runs,
+    // but a frame can already be in flight when that happens — so bail out rather
+    // than index into nothing. Cheap, and it turns a would-be crash into a no-op.
+    if app.state.tabs().is_empty() {
+        return true;
+    }
 
     let AppState {
         egui,
@@ -365,7 +403,7 @@ fn draw_frame(app: &mut AppState) -> bool {
             .inner_margin(egui::Margin::ZERO)
             .outer_margin(egui::Margin::ZERO);
         Panel::top("titlebar").frame(frame).show_inside(ui, |ui| {
-            let page_title = browser.title.borrow().clone();
+            let page_title = browser.active_tab().title.clone();
             let label = if page_title.is_empty() {
                 "Ferrous".to_owned()
             } else {
@@ -374,7 +412,18 @@ fn draw_frame(app: &mut AppState) -> bool {
             window_commands.extend(titlebar::draw(ui, &label, maximized.get()));
         });
 
-        let output = chrome.draw(ui);
+        // One borrow of the tab set for the whole chrome draw. `BrowserState`
+        // holds it behind a `RefCell`, which permits only one borrow at a time,
+        // so per-widget borrows would collide — and a borrow held past this block
+        // would panic the moment anything below read the model again.
+        //
+        // `len` is checked here because this is the one place that would
+        // otherwise index into an empty tab set.
+        let output = {
+            let mut tabs = browser.tabs_mut();
+            assert!(tabs.len() >= 1, "tab set emptied mid-frame");
+            chrome.draw(ui, &mut tabs)
+        };
         content_rect.set(Some(output.content_rect));
 
         // Whatever the toolbar did not claim belongs to the page.
@@ -387,14 +436,19 @@ fn draw_frame(app: &mut AppState) -> bool {
         // Servo renders into the offscreen framebuffer here.
         engine.paint();
 
-        // Drop an in-flight glide when the page changes. Scrolling the momentum
-        // of the page the user just left onto the page they just opened reads as
-        // a glitch, and the new document usually starts at the top anyway.
+        // Drop an in-flight glide when the page or the active tab changes.
+        // Scrolling the momentum of the page the user just left onto the page
+        // they just opened reads as a glitch, and a new document starts at the
+        // top anyway.
         {
-            let current = browser.url.borrow().clone();
-            if *seen_url.borrow() != current {
+            let (current, active) = {
+                let tabs = browser.tabs();
+                (tabs.active().url.clone(), tabs.active().id)
+            };
+            let seen = (current, active);
+            if seen_url.borrow().as_ref() != Some(&seen) {
                 scroll.cancel();
-                *seen_url.borrow_mut() = current;
+                *seen_url.borrow_mut() = Some(seen);
             }
         }
 
@@ -407,23 +461,31 @@ fn draw_frame(app: &mut AppState) -> bool {
         }
 
         for action in output.actions {
-            apply_action(engine, chrome, browser, action);
-        }
-
-        // Keep the page from stealing keys while the user is typing in the bar.
-        engine.set_focused(!browser.address_focused.get());
-
-        // Reflect the page title in the OS window title bar, but only when it
-        // actually changed: `set_title` is a syscall and this runs every frame.
-        let page_title = browser.title.borrow().clone();
-        if !page_title.is_empty() {
-            let mut last = last_window_title.borrow_mut();
-            if *last != page_title {
-                window.set_title(&format!("{page_title} - Ferrous"));
-                *last = page_title.clone();
+            if apply_action(engine, chrome, browser, action) {
+                close_window = true;
             }
         }
 
+        // Closing the last tab empties the tab set, and every accessor on it
+        // indexes directly, so nothing may read the model after that point.
+        // `apply_action` is deliberately the last thing that touches it.
+        //
+        // `address_focused` is a plain `Cell` and stays safe; only `active_tab`
+        // needs guarding.
+        engine.set_focused(!browser.address_focused.get());
+
+        if !close_window {
+            // Reflect the page title in the OS window title bar, but only when it
+            // actually changed: `set_title` is a syscall and this runs every frame.
+            let page_title = browser.active_tab().title.clone();
+            if !page_title.is_empty() {
+                let mut last = last_window_title.borrow_mut();
+                if *last != page_title {
+                    window.set_title(&format!("{page_title} - Ferrous"));
+                    *last = page_title.clone();
+                }
+            }
+        }
         // Blit the page into the window, underneath everything egui draws. The
         // background layer is painted first, so the toolbar composites on top.
         if let Some(render_to_parent) = offscreen_ctx.render_to_parent_callback() {
@@ -466,7 +528,7 @@ fn draw_frame(app: &mut AppState) -> bool {
             return true;
         }
     }
-    false
+    close_window
 }
 
 /// Carry out a window (not page) command. None of these block, so unlike the
@@ -544,7 +606,14 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
     true
 }
 
-fn apply_action(engine: &Engine, _chrome: &mut Chrome, state: &BrowserState, action: Action) {
+/// Carry out a chrome action. Returns true when the caller should shut the
+/// window down, which happens only when the last tab is closed.
+fn apply_action(
+    engine: &WebEngine,
+    _chrome: &mut Chrome,
+    state: &BrowserState,
+    action: Action,
+) -> bool {
     match action {
         Action::Navigate(input) => {
             let url = address::resolve(&input);
@@ -554,6 +623,46 @@ fn apply_action(engine: &Engine, _chrome: &mut Chrome, state: &BrowserState, act
         Action::Back => engine.go_back(),
         Action::Forward => engine.go_forward(),
         Action::Reload => engine.reload(),
+        Action::NewTab => open_new_tab(engine, state),
+        Action::SelectTab(id) => {
+            // `select` returns false for a tab that closed between the click and
+            // here, which is not an error.
+            if state.tabs_mut().select(id) {
+                engine.activate(id);
+            }
+        }
+        Action::CloseTab(id) => return close_tab(engine, state, id),
+    }
+    false
+}
+
+/// Open a blank-ish tab and make it active.
+///
+/// The new tab starts on the start page rather than `about:blank`, because
+/// `about:blank` is Servo's empty document and reads as a failed load.
+fn open_new_tab(engine: &WebEngine, state: &BrowserState) {
+    let id = state.tabs_mut().create(START_URL);
+    engine.open_tab(
+        id,
+        Url::parse(START_URL).expect("START_URL must be valid"),
+        true,
+    );
+}
+
+/// Close a tab and activate whichever one took its place.
+///
+/// Returns true when that was the last tab, so the caller can shut down.
+fn close_tab(engine: &WebEngine, state: &BrowserState, id: TabId) -> bool {
+    // The engine goes first: dropping the web view is what actually frees it, and
+    // doing that before the model forgets the tab means any callback still in
+    // flight has a tab to land on rather than being dropped.
+    engine.close_tab(id);
+    match state.tabs_mut().close(id) {
+        CloseOutcome::ClosedLast => true,
+        CloseOutcome::Closed(active) => {
+            engine.activate(active);
+            false
+        }
     }
 }
 
@@ -607,14 +716,53 @@ fn handle_shortcut(
         return true;
     }
 
+    // Tab shortcuts. All of these must be matched here, above the web view, or
+    // the page would receive them and do something entirely unrelated.
+    if primary {
+        if is_char('t') {
+            if pressed {
+                open_new_tab(&app.engine, &app.state);
+                app.window.request_redraw();
+            }
+            return true;
+        }
+        if is_char('w') {
+            if pressed {
+                let id = app.state.tabs().active().id;
+                if close_tab(&app.engine, &app.state, id) {
+                    app.close_requested.set(true);
+                }
+                app.window.request_redraw();
+            }
+            return true;
+        }
+        if matches!(event.logical_key, WinitKey::Named(WinitNamedKey::Tab)) {
+            if pressed {
+                // Ctrl+Shift+Tab goes backwards, matching every other browser.
+                let delta = if mods.shift_key() { -1 } else { 1 };
+                if let Some(id) = app.state.tabs_mut().select_offset(delta) {
+                    app.engine.activate(id);
+                }
+                app.window.request_redraw();
+            }
+            return true;
+        }
+    }
+
     false
+}
+
+/// Wheel events need a position but winit reports none, so the last known cursor
+/// position is reused.
+fn last_page_point(app: &AppState) -> WebViewPoint {
+    app.last_page_point.get()
 }
 
 /// Route an input event to the web page, translating out of the toolbar area.
 fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
     match event {
         WindowEvent::CursorMoved { position, .. } => {
-            let point = to_page(app, *position);
+            let point = page_point(*position, app.egui.egui_ctx.pixels_per_point(), app.content_rect.get());
             app.last_page_point.set(point);
             app.engine
                 .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
@@ -669,91 +817,6 @@ fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
                 .notify_input_event(InputEvent::Keyboard(keyboard_event(event, mods)));
         }
         _ => {}
-    }
-}
-
-/// Translate a window-space cursor position into web-view device pixels.
-///
-/// The subtraction of the content rectangle is the whole point: without it,
-/// clicking 40px into the toolbar would register as a click at (40, 0) of the
-/// page. servoshell does the equivalent at headed_window.rs:300-301.
-fn to_page(app: &AppState, position: PhysicalPosition<f64>) -> WebViewPoint {
-    let Some(rect) = app.content_rect.get() else {
-        return WebViewPoint::Device(DevicePoint::new(0.0, 0.0));
-    };
-
-    let pos = to_window_points(app, position);
-    WebViewPoint::Device(DevicePoint::new(
-        pos.x - rect.min.x,
-        pos.y - rect.min.y,
-    ))
-}
-
-/// Window-space cursor position in egui points (top-left origin).
-fn to_window_points(app: &AppState, position: PhysicalPosition<f64>) -> egui::Pos2 {
-    let ppp = app.egui.egui_ctx.pixels_per_point() as f64;
-    egui::pos2(
-        (position.x / ppp) as f32,
-        (position.y / ppp) as f32,
-    )
-}
-
-/// Wheel events need a position but winit reports none, so the last known cursor
-/// position is reused.
-fn last_page_point(app: &AppState) -> WebViewPoint {
-    app.last_page_point.get()
-}
-
-/// Key translation via `FromStr` on the winit `Debug` representation.
-///
-/// `keyboard_types::Key` is `enum { Character(String), Named(NamedKey) }` and its
-/// `FromStr` routes through `is_key_string`, which rejects multi-character ASCII
-/// strings — so "Enter" parses to a *named* key rather than a literal character.
-/// Characters are therefore handled explicitly.
-///
-/// This is a shortcut. servoshell carries a ~600 line exhaustive match table
-/// (ports/servoshell/desktop/keyutils.rs); a full keyboard milestone should port
-/// that rather than lean on Debug formatting.
-fn keyboard_event(event: &winit::event::KeyEvent, mods: ModifiersState) -> servo::KeyboardEvent {
-    let key = match &event.logical_key {
-        WinitKey::Character(text) => Key::Character(text.to_string()),
-        other => format!("{other:?}")
-            .parse()
-            .unwrap_or(Key::Named(NamedKey::Unidentified)),
-    };
-
-    let code = format!("{:?}", event.physical_key)
-        .parse::<Code>()
-        .unwrap_or(Code::Unidentified);
-
-    let mut modifiers = Modifiers::empty();
-    modifiers.set(Modifiers::CONTROL, mods.control_key());
-    modifiers.set(Modifiers::SHIFT, mods.shift_key());
-    modifiers.set(Modifiers::ALT, mods.alt_key());
-    modifiers.set(Modifiers::META, mods.super_key());
-
-    servo::KeyboardEvent::new_without_event(
-        match event.state {
-            ElementState::Pressed => KeyState::Down,
-            ElementState::Released => KeyState::Up,
-        },
-        key,
-        code,
-        Location::Standard,
-        modifiers,
-        event.repeat,
-        false,
-    )
-}
-
-fn mouse_button(button: WinitMouseButton) -> MouseButton {
-    match button {
-        WinitMouseButton::Left => MouseButton::Primary,
-        WinitMouseButton::Right => MouseButton::Secondary,
-        WinitMouseButton::Middle => MouseButton::Auxiliary,
-        WinitMouseButton::Back => MouseButton::Back,
-        WinitMouseButton::Forward => MouseButton::Forward,
-        WinitMouseButton::Other(n) => MouseButton::Other(n as u16),
     }
 }
 

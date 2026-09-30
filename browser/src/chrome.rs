@@ -1,17 +1,23 @@
-//! Browser chrome: navigation buttons and the address/search bar.
+//! Browser chrome: the tab strip, navigation buttons and the address/search bar.
 //!
-//! Pure UI. It reads [`BrowserState`], emits [`Action`]s, and reports the
-//! rectangle left over for web content. It never touches Servo.
+//! Pure UI. It reads the tab model, emits [`Action`]s, and reports the rectangle
+//! left over for web content. It never touches Servo.
+//!
+//! The tab set is taken as `&mut Tabs` for the whole frame rather than read
+//! widget by widget. `BrowserState` holds the model behind a `RefCell`, and a
+//! `RefCell` allows only one borrow at a time — a `tabs()` call here and an
+//! `active()` call in the next widget would panic at runtime, not at compile time.
 
 use std::rc::Rc;
 
 use egui::text::CCursor;
 use egui::{
-    Align, Id, Panel, Rect, Sense, Spinner, TextEdit, Ui, text_selection::CCursorRange,
+    Align, Button, Id, Panel, Rect, Sense, Spinner, TextEdit, Ui, text_selection::CCursorRange,
 };
 
 use crate::browser_state::BrowserState;
 use crate::icons;
+use crate::tab::{Tab, TabId, Tabs};
 
 /// Stable id for the address field. Explicit rather than auto-generated so that
 /// [`TextEdit::load_state`] can find the widget's state and select its text;
@@ -26,6 +32,13 @@ const SPINNER_SLOT: f32 = 24.0;
 const BUTTON: f32 = 24.0;
 const ICON_BUTTON: f32 = 22.0;
 
+/// Tab strip metrics. A fixed width per tab rather than a flexible one: with a
+/// flex layout, adding a tab resizes every other tab, which makes the strip jump
+/// under the pointer and is genuinely annoying to click.
+const TAB_HEIGHT: f32 = 28.0;
+const TAB_WIDTH: f32 = 176.0;
+const TAB_CLOSE_WIDTH: f32 = 22.0;
+
 /// Something the user asked for by clicking or typing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -33,6 +46,11 @@ pub enum Action {
     Back,
     Forward,
     Reload,
+    NewTab,
+    /// Close a tab. Carries the id rather than an index so it cannot be applied
+    /// to the wrong tab if the strip changes between the click and the drain.
+    CloseTab(TabId),
+    SelectTab(TabId),
 }
 
 /// What the chrome produced this frame.
@@ -65,7 +83,7 @@ impl Chrome {
         self.focus_address_bar_next_frame = true;
     }
 
-    /// Draw the toolbar and report the content rectangle.
+    /// Draw the tab strip, toolbar, and report the content rectangle.
     ///
     /// The content rectangle is derived from the toolbar panel's own response
     /// rect rather than `Ui::available_rect_before_wrap()`. The latter is
@@ -73,22 +91,24 @@ impl Chrome {
     /// a non-wrapping top-level layout, returns the full screen — it does not
     /// account for panels. servoshell likewise reads
     /// `outer.response.rect.max.y` (desktop/gui.rs:608).
-    pub fn draw(&mut self, ui: &mut Ui) -> Output {
+    pub fn draw(&mut self, ui: &mut Ui, tabs: &mut Tabs) -> Output {
         let mut actions = Vec::new();
+
+        self.tab_strip(ui, tabs, &mut actions);
 
         let frame = egui::Frame::new().fill(ui.visuals().panel_fill);
         let toolbar = Panel::top("toolbar").frame(frame).show_inside(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                self.nav_buttons(ui, &mut actions);
-                self.address_bar(ui, &mut actions);
-                self.loading_indicator(ui);
+                self.nav_buttons(ui, tabs, &mut actions);
+                self.address_bar(ui, tabs, &mut actions);
+                self.loading_indicator(ui, tabs);
             });
             ui.add_space(6.0);
         });
 
-        // `content_rect` rather than the deprecated `screen_rect`: this is the area
-        // actually available to draw in, which is what the web view should fill.
+        // `content_rect` rather than the deprecated `screen_rect`: this is the
+        // area actually available to draw in, which is what the web view fills.
         let content_bounds = ui.ctx().content_rect();
         let content_rect = Rect::from_min_max(
             egui::pos2(content_bounds.min.x, toolbar.response.rect.max.y),
@@ -101,18 +121,114 @@ impl Chrome {
         }
     }
 
-    fn nav_buttons(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    /// One row of tabs, plus a new-tab button.
+    fn tab_strip(&self, ui: &mut Ui, tabs: &Tabs, actions: &mut Vec<Action>) {
+        let frame = egui::Frame::new().fill(ui.visuals().panel_fill);
+        Panel::top("tabs").frame(frame).show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                for tab in tabs.iter() {
+                    self.tab(ui, tab, tabs, actions);
+                }
+
+                // Plain ASCII rather than a symbol: egui's bundled font has no
+                // Dingbats coverage, so U+2715 renders as a tofu box. Same
+                // reason the nav icons are painted.
+                if ui
+                    .add_sized([BUTTON, TAB_HEIGHT], Button::new("+").frame(false))
+                    .on_hover_text("New tab (Ctrl+T)")
+                    .clicked()
+                {
+                    actions.push(Action::NewTab);
+                }
+                ui.add_space(4.0);
+            });
+        });
+    }
+
+    fn tab(&self, ui: &mut Ui, tab: &Tab, tabs: &Tabs, actions: &mut Vec<Action>) {
+        let selected = tab.id == tabs.active().id;
+        let label_width = (TAB_WIDTH - TAB_CLOSE_WIDTH).max(40.0);
+
+        // No inter-item spacing inside a tab, for the same reason the title-bar
+        // controls have none: it would make each tab 8pt wider than `TAB_WIDTH`,
+        // so tabs would drift apart and the close button would not sit where the
+        // geometry predicts. Found by a click test that missed by exactly 8pt.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.horizontal(|ui| {
+            // `Sense::click` plus manual painting rather than `Button`, so the
+            // active tab can be tinted without the default frame fighting it.
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(label_width, TAB_HEIGHT), Sense::click());
+            let visuals = ui.visuals().clone();
+            let fill = if selected {
+                visuals.selection.bg_fill
+            } else {
+                visuals.widgets.noninteractive.bg_fill
+            };
+            ui.painter().rect_filled(rect, 3.0, fill);
+
+            // One line, clipped to the tab. `layout` would *wrap* a long title
+            // onto three lines, and centring that block pushes the text out of
+            // the strip and over the toolbar — which is exactly what the first
+            // version did. The full URL is in the tooltip.
+            let galley = ui.painter().layout_no_wrap(
+                tab.label().to_owned(),
+                egui::FontId::proportional(12.0),
+                visuals.text_color(),
+            );
+            ui.painter()
+                .with_clip_rect(rect.shrink(4.0))
+                .galley(
+                    egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    visuals.text_color(),
+                );
+
+            if response.clicked() {
+                actions.push(Action::SelectTab(tab.id));
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // The full URL as a tooltip; the label is clipped to a tab width.
+            response.on_hover_text(&tab.url);
+
+            let (close_rect, close_response) = ui.allocate_exact_size(
+                egui::vec2(TAB_CLOSE_WIDTH, TAB_HEIGHT),
+                Sense::click(),
+            );
+            if close_response.hovered() {
+                ui.painter()
+                    .rect_filled(close_rect, 3.0, visuals.widgets.hovered.bg_fill);
+            }
+            let cross = egui::Align2::CENTER_CENTER;
+            ui.painter()
+                .text(close_rect.center(), cross, "x", egui::FontId::proportional(12.0), visuals.weak_text_color());
+
+            if close_response.clicked() {
+                actions.push(Action::CloseTab(tab.id));
+            }
+            if close_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            close_response.on_hover_text("Close tab (Ctrl+W)");
+        });
+    }
+
+    fn nav_buttons(&self, ui: &mut Ui, tabs: &Tabs, actions: &mut Vec<Action>) {
         let size = egui::vec2(BUTTON, ICON_BUTTON);
         let (back, back_response) = ui.allocate_exact_size(size, Sense::click());
         let (forward, forward_response) = ui.allocate_exact_size(size, Sense::click());
         let (reload, reload_response) = ui.allocate_exact_size(size, Sense::click());
 
         // Disabled rather than hidden: a button that appears and disappears
-        // makes the toolbar jump around, and a dimmed one still says "Back"
-        // in its tooltip.
+        // makes the toolbar jump around, and a dimmed one still says "Back" in
+        // its tooltip.
+        let active = tabs.active();
+        let (back_on, forward_on) = (active.can_go_back, active.can_go_forward);
         let on = ui.visuals().weak_text_color();
         let off = icons::dim(on);
-        let (back_on, forward_on) = (self.state.can_go_back.get(), self.state.can_go_forward.get());
 
         let painter = ui.painter().clone();
         icons::back(&painter, back.center(), if back_on { on } else { off });
@@ -148,16 +264,20 @@ impl Chrome {
         ui.add_space(8.0);
     }
 
-    /// A spinner while the page loads. The engine already reports load status
-    /// via `notify_load_status_changed`, so this costs nothing but a widget.
-    fn loading_indicator(&self, ui: &mut Ui) {
-        if self.state.loading.get() {
+    /// A spinner while the active page loads. The engine already reports load
+    /// status, so this costs nothing but a widget.
+    fn loading_indicator(&self, ui: &mut Ui, tabs: &Tabs) {
+        if tabs.active().loading {
             ui.add(Spinner::new().size(14.0));
         }
     }
 
-    fn address_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let mut text = self.state.address_text.borrow_mut();
+    fn address_bar(&mut self, ui: &mut Ui, tabs: &mut Tabs, actions: &mut Vec<Action>) {
+        // Read the committed URL first: the borrow of `address_text` below lasts
+        // for the whole widget and cannot overlap a second borrow of `tabs`.
+        let committed = tabs.active().url.clone();
+
+        let text = &mut tabs.active_mut().address_text;
 
         // Reserve room for the loading indicator. With
         // `desired_width(f32::INFINITY)` the field claims the entire row and
@@ -166,7 +286,7 @@ impl Chrome {
 
         let response = ui.add_sized(
             [width, 22.0],
-            TextEdit::singleline(&mut *text)
+            TextEdit::singleline(text)
                 .id(ADDRESS_BAR_ID())
                 .hint_text("Search or enter address")
                 .vertical_align(Align::Center),
@@ -191,7 +311,7 @@ impl Chrome {
         // egui 0.34 has no `select_all_on_focus` option, so the selection is set
         // through the widget's public `load_state`/`store_state`.
         if focused && !self.address_focused_last_frame {
-            select_all(ui.ctx(), &text);
+            select_all(ui.ctx(), text);
         }
         self.address_focused_last_frame = focused;
 
@@ -202,7 +322,7 @@ impl Chrome {
         // loaded. Without this a half-typed URL sticks around and looks like the
         // browser's real location, which is worse than showing nothing.
         if focused && escape {
-            *text = self.state.url.borrow().clone();
+            *text = committed;
             response.surrender_focus();
             return;
         }
@@ -223,9 +343,8 @@ impl Chrome {
             } else {
                 // Lost focus without submitting: put the real address back so the
                 // bar never displays text the browser is not actually on.
-                let current = self.state.url.borrow().clone();
-                if text.trim() != current {
-                    *text = current;
+                if text.trim() != committed {
+                    *text = committed;
                 }
             }
         }

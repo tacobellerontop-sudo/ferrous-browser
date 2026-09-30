@@ -1131,3 +1131,134 @@ sites" is too strong a claim.
 - Synthetic `keybd_event` typing drops characters; clipboard paste via
   `Ctrl+V` did not register either. Test-harness limitation, not a browser bug —
   but it means address-bar tests need a human or a different input path.
+---
+
+## 2026-09-30 — Entry 011: MILESTONE 3 ACHIEVED — tabs
+
+### What changed
+
+- `browser/src/tab.rs` — **new.** `TabId`, `Tab`, `Tabs`: the tab model.
+  Engine-neutral, no Servo, no egui, 25 unit tests.
+- `browser/src/browser_state.rs` — now owns the `Tabs` plus a queue of pending
+  engine callbacks. The flat `url`/`title`/`can_go_back`/`can_go_forward`/`loading`
+  fields moved onto `Tab`, so each tab has its own.
+- `browser/src/engine.rs` — one `WebView` per tab, `HashMap<TabId, WebView>`.
+  Per-tab delegate. Only the active web view is painted, resized and given input.
+- `browser/src/chrome.rs` — tab strip: title/address label, close button, new-tab
+  button, active-tab tint.
+- `browser/src/input.rs` — **new.** winit→Servo translation, extracted from
+  `main.rs` and made pure so it could be tested.
+- `browser/src/main.rs` — wiring and shortcuts.
+
+Adopted from `docs/hermes-research.md`: idea 1 (engine-neutral core), idea 2
+(Command/Event carrying a stable `TabId`), idea 3 (queue rather than apply
+inline), idea 7 (only one web view visible), idea 8 (resize through the web view,
+not the shared context), idea 10 (shortcuts above the web view).
+
+### Servo facts this was built on (all read from the checkout)
+
+| Fact | Location |
+| --- | --- |
+| `WebView` is `Rc<RefCell<WebViewInner>>`, derives `Clone`, `PartialEq` by id | `components/servo/webview.rs:84` |
+| **`WebViewInner` implements `Drop`** → sends `CloseWebView` + `remove_webview`. Dropping the last clone is the *only* way a web view is destroyed; there is no `close()` | `webview.rs:144-151` |
+| **`hidden` defaults to `false`** — a new web view is VISIBLE, so a background tab must be hidden explicitly or it paints over the active one | `components/paint/webview_renderer.rs:161` |
+| `show()` / `hide()` exist; hidden web views are never "animating" and the constellation is told to stop work on them | `webview.rs:489,497`; `webview_renderer.rs:188,197` |
+| **`set_throttled` does not exist** in this version — it was removed. Hiding is the only background-tab saving available | method list, `webview.rs:291-731` |
+| `WebViewBuilder::new(&servo, Rc<dyn RenderingContext>)` — many web views may share one rendering context | `webview.rs:1082` |
+
+### Design decisions worth recording
+
+**`TabId` is never reused.** Engine callbacks arrive asynchronously on Servo's
+own threads. A title change for a background tab must land on *that* tab, not on
+whichever is active when the queue drains. If ids were recycled, a late callback
+from a closed tab could be applied to a brand new one. A monotonically
+increasing counter makes that impossible rather than unlikely. Tested.
+
+**Callbacks are queued, never applied inline.** The delegate only pushes a
+`TabEvent`; `drain_events()` applies them once per frame before anything reads
+the model. Writing straight into the model from the callback would mean a
+`RefCell` borrow held across a call that can re-enter the delegate — `paint()`
+and `spin()` both can — which is a runtime panic waiting for the wrong frame.
+
+**The engine does not know which tab is "active" as state.** It is handed a
+`TabId` and told to activate it. Selection policy lives in `Tabs`, which is
+testable; the engine only knows how to show and hide.
+
+**Fixed tab width.** A flexible layout resizes every tab when one is added, which
+makes the strip jump under the pointer. Constant width is less pretty and
+actually clickable.
+
+### Problems hit
+
+**P41. `RefCell already mutably borrowed` at startup — app crashed immediately.**
+`draw_frame` took one `tabs_mut()` for the whole egui closure, then read the model
+again later in the same closure (the seen-URL check, the window title, and
+`apply_action` itself). `RefCell` permits one borrow at a time, so the first
+`tabs()` inside panicked. Fixed by scoping the borrow tightly around
+`chrome.draw`.
+
+**P42. `index out of bounds: the len is 0 but the index is 0`.** Closing the last
+tab empties the model, and every accessor indexes directly. The guard at the top
+of `draw_frame` did not help because `apply_action` runs *inside* the frame and
+emptied it before the later reads. Fixed by making `apply_action` the last thing
+that touches the model and guarding the one read after it.
+
+**P43. Tab labels overflowed the strip and painted over the toolbar.**
+`Painter::layout` *wraps*, so a long page title became three lines and centring
+that block pushed it out of a 28pt strip. Fixed with `layout_no_wrap` plus
+`with_clip_rect`.
+
+**P44. The close button was 8pt from where the geometry said.** `ui.horizontal`
+inserts inter-item spacing, so each tab was 184pt wide rather than the 176 the
+constants implied. Found because a click test missed by exactly 8pt. Fixed by
+zeroing `item_spacing` inside the tab, as was already done for the title bar.
+
+**P45. Test-harness trap, worth remembering.** `Process.MainWindowHandle` was
+returning a 16x16 winit helper window ("Winit Thread Event Target"), not the
+browser, so screenshots were of the wrong window and every click missed. The
+helper now enumerates windows and picks the largest visible one per PID. Several
+minutes were lost to chasing a "black window" that was a terminal.
+
+**P46. A test asserted the wrong arithmetic.** `page_point` at 150% scale:
+I expected y=20 for physical y=90, but 90/1.5 = 60 egui points and the content
+rect starts at 60, so the answer is 0. The implementation was right. Added a
+100%-scale control test so the two cases can be compared.
+
+### Verified on screen
+
+| Behaviour | Result |
+| --- | --- |
+| Tab strip renders, one tab, correct label and close button | yes |
+| New tab via `+` and via Ctrl+T | `opened tab N`, `activated tab N` |
+| Switch by clicking a tab | `activated tab N` |
+| Ctrl+Tab cycles forward, wraps | 3 → 1 |
+| Ctrl+Shift+Tab cycles backward, wraps | 1 → 2 |
+| Close via the × | `closed tab N`, correct tab activated |
+| Closing the active tab selects the one to its right | yes |
+| Closing the rightmost active tab falls back to the left | `closed tab 3` → `activated tab 2` |
+| Closing the last tab shuts the window down | process exits |
+| Ctrl+W on the only tab shuts down | process exits |
+| **Per-tab scroll position retained across switches** | scrolled tab 2 by 8, switched away, back — identical position |
+
+That last one is the real proof that the tabs are independent: each has its own
+`WebView`, and the screenshots before and after the round trip are the same.
+
+**Idle CPU with 2 tabs: 0 ms over 6 s.** Background tabs cost nothing, which was
+the point of hiding them. Working set 163 MB for one tab, 227 MB for two.
+
+72 unit tests pass; our crate is warning-free. `main.rs` went from 933 to 852
+lines with the input extraction.
+
+### Not verified
+
+- **Background tabs are hidden but not throttled.** `set_throttled` no longer
+  exists, so `hide()` is the only lever. Servo does tell the constellation the
+  web view is hidden, which stops animation-driven redraws, but it is not a
+  suspension mechanism. A heavy background tab still consumes CPU in its own
+  process. Measured as 0 ms here because servo.org is static, not because
+  suspension works.
+- **Ctrl+W with several tabs** was exercised via the × buttons; the shortcut path
+  shares `close_tab` with it and was only tested on the single-tab case.
+- Right-edge window resize is still unconfirmed (Entry 008/009).
+- No tab reordering by dragging, and no tab overflow scrolling when there are more
+  tabs than fit. Both are deliberate omissions, not bugs.
