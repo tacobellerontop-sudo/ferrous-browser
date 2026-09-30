@@ -999,3 +999,135 @@ the drag that wedged the app did not actually move the window.
 Right-edge resize was already unverified in Entry 008 and is still is. The
 resize path shares `send_non_client` and the new `run_modal_gesture` guard with
 the drag, so it is no worse, but it is not confirmed.
+---
+
+## 2026-09-30 — Entry 010: YouTube investigation, and enabling Servo's pref-gated features
+
+### The report
+
+> YouTube doesn't load very well. Maybe it's because of Servo but could you
+> investigate?
+
+### What YouTube actually did
+
+Loaded `https://www.youtube.com/` and waited 60 s. The page was **not blank**:
+
+- header, logo, hamburger, search box, mic, overflow menu, Sign in — all rendered
+- sidebar rendered
+- the body showed YouTube's **logged-out empty state**: *"Try searching to get
+  started — Start watching videos to help us build a feed of videos you'll love."*
+
+So the shell worked and the **feed** was missing. No crash, no hang, no error
+page. Working set 373–413 MB, CPU slowly ticking (~2% of one core).
+
+### Turning up the logging
+
+`Servo::setup_logging` uses `env_logger::Env::default()` (servo.rs:1080-1090),
+which filters at **Error** unless `RUST_LOG` is set. That is why the first run
+produced an empty stderr file — not because nothing was wrong.
+
+With `RUST_LOG=info` the log grew to **3.3 MB** and showed:
+
+- **no** JS errors (one `fail to evaluate module`, which servo.org also produces)
+- **no** network errors, no TLS failures
+- thousands of dropped CSS rules, of three kinds:
+  - ~73 vendor-prefixed scrollbar/pseudo rules (`::-webkit-scrollbar`) — cosmetic
+  - 29 `view-transition-*` rules — View Transitions is unimplemented
+  - **`17 :has()` rules**, including
+    `#content.ytd-rich-section-renderer:has(>grid-shelf-view-model)` — the feed
+    container's own layout rule
+
+### A probe page, because CSS.supports is not enough
+
+Rather than infer from the log, served a 41-feature probe page over HTTP and
+read the answers off the screen. Before any change:
+
+| Present | Missing |
+| --- | --- |
+| `customElements`, `attachShadow`, `MutationObserver`, `ResizeObserver`, `fetch`, `WebAssembly`, `Proxy`, `Intl.Segmenter`, `:is()`, `:where()`, `@layer` | **`:has()`**, **`IntersectionObserver`**, **`@container`**, **`adoptedStyleSheets`**, **`Worker`**, **`SharedWorker`**, **`MediaSource`**, **`navigator.serviceWorker`**, `requestIdleCallback`, `navigator.mediaDevices`, `crypto.randomUUID`, `view-transition-name`, `container-type`, `aspect-ratio`, `backdrop-filter`, `content-visibility` |
+
+### The fix that was available: Servo's own experimental preferences
+
+Servo ships these features switched **off** by default. The authoritative list is
+servoshell's `EXPERIMENTAL_PREFS` (ports/servoshell/prefs.rs:33-53), the set it
+enables behind `--enable-experimental-web-platform-features`. Applied that via
+`ServoBuilder::preferences`, plus `dom_cookiestore_enabled`, which is not on that
+list but without which a site cannot write its own cookies.
+
+`browser/src/prefs.rs` now does this. The important wrinkle: `Preferences::set_value`
+**silently ignores a name it does not recognise**, so a typo would leave a feature
+off with nothing reporting it. Each name is therefore paired with a getter for
+the field it controls, and a test reads the field back — the names are checked by
+the compiler and by a test, not by hope.
+
+### Verified effect of the preferences
+
+Re-ran the probe with them on: **23 → 25 of 41**, the two additions being
+`IntersectionObserver` and `adoptedStyleSheets`, both previously absent.
+
+No regression: servo.org renders identically, working set 174 → 163 MB.
+YouTube working set 413 → 373 MB.
+
+### YouTube still does not work — and why
+
+The feed is still empty. The decisive evidence is in the network log:
+
+```
+POST https://www.youtube.com/youtubei/v1/log_event   x6   -> 200
+POST https://www.youtube.com/youtubei/v1/guide              -> 200
+POST https://www.youtube.com/youtubei/v1/feedback           -> 200
+(no youtubei/v1/browse at all)
+```
+
+The Polymer app **boots and runs** — it logs telemetry, fetches the guide, posts
+feedback, all successfully. It simply never dispatches the `browse` request that
+loads the home feed. So this is not a network, TLS, or CORS problem.
+
+Cross-check on the wire: fetching the same URL from PowerShell with a normal
+browser UA returns 873 KB containing `ytInitialData` and `richGridRenderer` but
+**zero `videoId`s**. The feed is genuinely fetched client-side, after boot.
+
+The features that are missing are the plausible causes, and the two decisive ones
+are **not preference-gated**:
+
+- **dedicated `Worker`** — absent with prefs on *and* off. YouTube's data layer
+  uses web workers.
+- **`:has()`** — still dropped 17 times with all prefs enabled.
+- **`MediaSource`** — absent either way. Even a working feed could not play video,
+  since YouTube streams via MSE.
+
+### Verdict
+
+**This is Servo, not our integration.** There is no embedder-side change that
+makes YouTube's home feed work on this checkout, and video playback is out of
+reach regardless because `MediaSource` does not exist here. The preferences are
+still worth shipping — they are a real, measurable compatibility improvement
+(`IntersectionObserver` and `adoptedStyleSheets` are common on the modern web)
+and they cost nothing in memory.
+
+Sites that were already fine are unaffected: servo.org and DuckDuckGo both render
+correctly with them on. DuckDuckGo in particular — a fairly modern page — renders
+essentially perfectly, which is a useful reminder that "Servo can't do modern
+sites" is too strong a claim.
+
+### Deliberately not enabled
+
+- `dom_serviceworker_enabled` — YouTube registers one, but Servo's is partial and
+  a mis-serving worker can replace a good page with a cached error. Wants a
+  dedicated experiment, not a blind default.
+- `media_glvideo_enabled` — servoshell forces it off for headless windows
+  (prefs.rs:608-611), so it is headed-only, and there is no media backend on
+  Windows anyway.
+- `dom_worklet_enabled` — downstream of the missing `MediaSource`.
+- `dom_webgpu_enabled` — no adapter under our ANGLE context.
+- `dom_notification_enabled`, `dom_permissions_enabled` — these raise UI prompts
+  this browser does not implement, so enabling them only produces dead ends.
+
+### Side findings
+
+- **Ctrl+V paste does not work**; `dom_async_clipboard_enabled` was false and is
+  now on, but paste is still unverified.
+- servo.org itself logs one `fail to evaluate module`.
+- Synthetic `keybd_event` typing drops characters; clipboard paste via
+  `Ctrl+V` did not register either. Test-harness limitation, not a browser bug —
+  but it means address-bar tests need a human or a different input path.

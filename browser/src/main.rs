@@ -50,6 +50,7 @@ mod browser_state;
 mod chrome;
 mod engine;
 mod icons;
+mod prefs;
 mod scroll;
 mod titlebar;
 

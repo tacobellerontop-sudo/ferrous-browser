@@ -41,6 +41,7 @@ impl Engine {
         initial_url: Url,
     ) -> Self {
         let servo = ServoBuilder::default()
+            .preferences(crate::prefs::web_compat())
             .event_loop_waker(waker)
             .build();
         servo.setup_logging();
