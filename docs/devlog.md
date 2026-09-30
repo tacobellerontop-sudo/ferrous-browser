@@ -473,3 +473,107 @@ a missing-DLL error. This is now a hard prerequisite, enforced in CI.
 - Whether cross-process paint works when embedded (still defaulting to
   single-process via `Opts::default()`).
 - Anything at all about tabs, chrome, or navigation UI.
+
+---
+
+## 2026-09-29 — Entry 005: MILESTONE 2 — browser shell
+
+### What changed
+
+Split the single 346-line spike into four focused modules and added the browser
+shell: back / forward / reload buttons plus an address-and-search bar, composed
+over the live web view.
+
+```text
+browser/src/
+  main.rs           window, event loop, frame orchestration, input routing
+  chrome.rs         egui toolbar; returns Action list + content rect
+  browser_state.rs  state shared between UI and engine delegate
+  engine.rs         the ONLY module that knows Servo types exist
+  address.rs        URL-vs-search classification (pure, 9 unit tests)
+```
+
+Also added `LICENSE` (MPL-2.0 — matches Servo, and we will likely need to patch
+Servo, which MPL-2.0 obliges us to publish).
+
+### The architecture that made this work
+
+`App` **owns** `AppState`; only the delegate holds `Rc`s. My first attempt put
+`EguiGlow` and `Chrome` behind an `Rc` and reached them through `unsafe` pointer
+casts to get `&mut`. That was wrong — it is exactly the kind of unsafe hack the
+project rules forbid — and it was unnecessary, because the delegate only ever
+needs `Rc<BrowserState>` and a way to request a redraw.
+
+With `App` owning `AppState`, `draw_frame` destructures the fields so that
+`egui` is borrowed mutably at the same time as `engine`/`chrome`. Disjoint field
+borrows, no unsafe.
+
+### Problems encountered and how they were solved
+
+**P22. `Ui::available_rect_before_wrap()` does not account for panels.** The
+first working build logged `content_rect = [0,0]-[1100,820]` — the full window,
+meaning the toolbar consumed zero height and the page covered it completely.
+
+The method is documented as "what is left on this row/column before wrapping";
+with a non-wrapping top-level layout it returns the full screen. There is no
+`Context` equivalent either.
+
+Fixed by reading the toolbar panel's own `response.rect` and constructing the
+content rect from it, which is what servoshell does (`desktop/gui.rs:608`).
+
+**P23. `Panel::show` is deprecated in egui 0.34.3** (`#[deprecated = "Use
+show_inside() instead"]`, epaint/panel.rs:1048). Using `show_inside(ui, ..)`
+against the root `Ui` both silences the deprecation and is what makes the
+panel participate in layout correctly.
+
+**P24. `winit::window::Window` is no longer `Clone` in winit 0.30** (it was in
+0.29). The delegate needs the window to request repaints, so `AppState` holds
+`Rc<Window>` and passes a clone of the `Rc`.
+
+**P25. The blit callback needs euclid geometry, not egui rects.**
+`render_to_parent` expects `Rect<i32, UnknownUnit>` in device pixels with a
+bottom-left origin. Passing an `egui::Rect` (f32 points, top-left) is a type
+error; the imports are aliased (`EuclidRect`, `EuclidPoint`, `EuclidSize`) so the
+two `Rect` types cannot be confused.
+
+**P26. The ANGLE copy script copied files onto themselves** once the DLLs were
+already staged. It searched recursively and found the staged copy first. Now it
+searches only `target/*/build/mozangle-*/out/`, which is where mozangle's
+`build.rs` actually emits them.
+
+**P27. Cursor coordinates need translating out of the toolbar.** A raw winit
+cursor position is in *window* coordinates; the page's origin is below the
+toolbar. Without subtracting the content rect, clicking the toolbar would
+register as a click at the top of the page. `to_page()` does this conversion.
+
+### Verified working (screenshots)
+
+- Window opens with toolbar; back/forward correctly **disabled** with no history.
+- Page renders beneath the chrome — egui and Servo share one GL context, and the
+  offscreen FBO blit composites correctly.
+- Real GPU: `Renderer: ANGLE (AMD, AMD Radeon 780M Graphics Direct3D11,
+  OpenGL ES 3.0)`.
+- **Mouse hover** — links highlight.
+- **Mouse click** — opened the "Get Involved" dropdown.
+- **Address bar updates live** from `notify_url_changed` (picked up `#`).
+- Input routing confirmed by instrumentation: correct `content_rect`, and
+  keyboard events correctly *withheld* from the page while the address bar has
+  focus.
+
+### NOT verified
+
+- Back / forward / reload buttons actually navigating.
+- Address-bar navigation (typing + Enter).
+- Keyboard input reaching page content.
+
+Synthetic mouse clicks kept missing because the window moves between
+`SetForegroundWindow` and the click, and synthetic `SendInput` did not reliably
+reach the TextEdit. I stopped rather than keep guessing at screen coordinates.
+**These need a human at the keyboard.** They are wired (`apply_action` handles
+each variant, `address::resolve` is unit tested) but "wired" is not "verified".
+
+### Also worth noting
+
+An earlier observation that the address bar appeared focused at startup was an
+artifact of my own test clicks, not a bug: instrumented logs show
+`address_focused=false` in normal operation.

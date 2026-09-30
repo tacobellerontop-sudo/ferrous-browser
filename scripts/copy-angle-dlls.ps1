@@ -36,12 +36,19 @@ $BinDir = (Resolve-Path -LiteralPath $BinDir).Path
 $targetRoot = Join-Path $PSScriptRoot '..\browser\target'
 
 Write-Host "Looking for ANGLE DLLs under $targetRoot ..."
+# Search only mozangle's build-script output directories. A naive recursive
+# search finds the *already staged* copies sitting in the binary directory first
+# and then tries to copy a file onto itself.
+$outDirs = Get-ChildItem -Path (Join-Path $targetRoot '*\build\mozangle-*\out') -Directory -ErrorAction SilentlyContinue
+
 $found = @{}
 foreach ($dll in 'libEGL.dll', 'libGLESv2.dll') {
-    $match = Get-ChildItem -Path $targetRoot -Recurse -Filter $dll -File -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    $match = $outDirs | ForEach-Object {
+        $candidate = Join-Path $_.FullName $dll
+        if (Test-Path -LiteralPath $candidate) { Get-Item -LiteralPath $candidate }
+    } | Select-Object -First 1
     if (-not $match) {
-        throw "Could not find $dll under $targetRoot. Has 'cargo build' finished the mozangle build script?"
+        throw "Could not find $dll in any mozangle OUT_DIR under $targetRoot. Has 'cargo build' finished the mozangle build script?"
     }
     $found[$dll] = $match
     Write-Host ("  found {0} -> {1}" -f $dll, $match.FullName.Replace($targetRoot, '<target>'))
@@ -49,6 +56,10 @@ foreach ($dll in 'libEGL.dll', 'libGLESv2.dll') {
 
 foreach ($dll in $found.Keys) {
     $dest = Join-Path $BinDir $dll
+    if ([string]::Equals($found[$dll].FullName, $dest, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "  $dll already staged"
+        continue
+    }
     Copy-Item -LiteralPath $found[$dll].FullName -Destination $dest -Force
     Write-Host "  copied $dll -> $dest"
 }
