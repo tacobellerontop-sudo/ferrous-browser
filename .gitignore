@@ -1,0 +1,9 @@
+target/
+**/*.rs.bk
+
+# Servo checkout is pinned to an exact commit; see docs/servo-version.md.
+# It is kept on disk (we build against it by path) but is not part of this repo.
+servo/
+
+# Local scratch
+*.log

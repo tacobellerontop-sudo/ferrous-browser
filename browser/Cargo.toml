@@ -1,0 +1,80 @@
+[workspace]
+# NOTE: this manifest is deliberately the workspace root and lives INSIDE
+# `browser/`, not at the project root.
+#
+# Cargo resolves a path dependency's `workspace = true` fields against the
+# nearest ancestor manifest that declares `[workspace]`. If our workspace root
+# were `Ferrous Browser/Cargo.toml`, it would be an ancestor of `servo/`, so
+# Cargo would try to inherit Servo's `edition.workspace = true` from OUR
+# workspace and fail with:
+#
+#   error inheriting `edition` from workspace root manifest's
+#   `workspace.package.edition`  /  `workspace.package.edition` was not defined
+#
+# Keeping the workspace root in `browser/` makes it a sibling of `servo/` rather
+# than an ancestor, so Servo's own `Cargo.toml` is found and its
+# `[workspace.package]` resolves correctly. Verified empirically; see
+# docs/devlog.md entry 002.
+resolver = "2"
+
+[package]
+name = "ferrous-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Milestone 1 spike. One binary, no modules, no abstractions.
+# See docs/next-step.md for why this exists and what it must prove.
+[[bin]]
+name = "ferrous-browser"
+path = "src/main.rs"
+
+[dependencies]
+# Servo is an ENGINE dependency: a path dependency on our pinned checkout, so we
+# get the exact revision recorded in docs/servo-version.md rather than whatever
+# crates.io currently serves. Version justification for each entry is in
+# docs/dependencies.md.
+servo = { path = "../servo/components/servo", features = ["no-wgl"] }
+
+# Versions must match servo/Cargo.lock or the process ends up with two
+# incompatible copies of the same crate.
+winit = "0.30.13"
+euclid = "0.22"
+url = "2.5"
+log = "0.4"
+# Servo cannot open TLS connections until a rustls crypto provider is installed.
+# See components/servo/examples/winit_minimal.rs:25-28.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+
+# ---------------------------------------------------------------------------
+# Replicated from servo/Cargo.toml. Cargo does NOT inherit profile tables across
+# workspaces, so these must be repeated here or Servo misbehaves.
+#
+# REQUIRED ON WINDOWS: without this the servo-script rlib exceeds 4 GB and the
+# build fails (rust-lang/rust#151184). See docs/servo-version.md.
+#
+# NOTE: this is repeated under BOTH `dev` and `medium`. A custom profile that
+# does `inherits = "dev"` inherits the base settings but NOT the
+# `profile.dev.package.*` overrides, so each profile needs its own copy.
+# ---------------------------------------------------------------------------
+[profile.dev.package.servo-script]
+codegen-units = 16
+
+# servo/Cargo.toml:390-391
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+# Servo's `medium` profile (servo/Cargo.toml:422-425): inherits dev but compiles
+# optimised with line-tables-only debug info. Chosen over plain `dev` because
+# full debug info makes a Servo target dir enormous, and we have limited disk.
+[profile.medium]
+inherits = "dev"
+opt-level = 2
+incremental = true
+debug = "line-tables-only"
+
+[profile.medium.package.servo-script]
+codegen-units = 16
+
+[profile.medium.package.crypto-bigint]
+opt-level = 3

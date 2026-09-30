@@ -1,0 +1,15 @@
+# Replicated from servo/.cargo/config.toml. Cargo resolves .cargo/config.toml by
+# walking up from the current directory, so our workspace would otherwise fall
+# back to Cargo defaults and miss these.
+
+# Servo does not use the default MSVC linker on Windows.
+# Source: servo/.cargo/config.toml:16-17
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link.exe"
+
+[env]
+# Source: servo/.cargo/config.toml:33
+# Every `#![feature(..)]` in Servo is `#![cfg_attr(crown, ..)]`, and `crown` is
+# not in the default feature set, so this is currently inert. It is replicated
+# for fidelity only and must NOT be extended to cover our own crates.
+RUSTC_BOOTSTRAP = "crown,script,script_webgpu,script_bindings,style_tests,mozjs,mozjs_sys"

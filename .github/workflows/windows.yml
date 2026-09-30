@@ -1,0 +1,115 @@
+name: Windows
+
+# Why this workflow exists
+# ----------------------
+# A bare `cargo build` on a clean machine does NOT work for this project. It
+# needs two things that `mach` normally supplies:
+#
+#   1. moztools 4.0, downloaded by `mach fetch`, required to build SpiderMonkey.
+#   2. libEGL.dll / libGLESv2.dll copied next to the executable, because we use
+#      Servo's `no-wgl` feature (ANGLE) on Windows.
+#
+# Both were found the hard way: our local build only worked because someone had
+# already run `mach bootstrap` on this machine. This workflow builds from a
+# clean checkout so that gap cannot silently return.
+#
+# Servo is NOT vendored into this repository. It is cloned here at the exact
+# revision pinned in docs/servo-version.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Servo's clean Windows build is slow; the default 360-minute job cap is not
+# generous enough for a from-scratch SpiderMonkey + ANGLE build on a cold cache.
+timeout-minutes: 360
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with docs/servo-version.md. Changing this is a documented update.
+  SERVO_SHA: b2ef57f642816e77e67e5a322ddccdbde6784f3c
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build browser (medium profile)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout browser
+        uses: actions/checkout@v4
+
+      # Shallow clone of Servo, then force-fetch the exact pinned commit: a
+      # `--depth 1` clone of a branch tip will not contain an arbitrary SHA.
+      - name: Clone Servo at pinned revision
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/servo/servo.git servo
+          git -C servo fetch --depth 1 origin $env:SERVO_SHA
+          git -C servo checkout $env:SERVO_SHA
+          # Guard against the pin silently drifting from docs/servo-version.md.
+          $actual = (git -C servo rev-parse HEAD).Trim()
+          if ($actual -ne $env:SERVO_SHA) {
+            throw "Servo revision mismatch: wanted $env:SERVO_SHA, got $actual"
+          }
+          Write-Host "Servo pinned at $actual"
+
+      - name: Install uv (required by mach)
+        shell: pwsh
+        run: irm https://astral.sh/uv/install.ps1 | iex
+
+      - name: Add uv to PATH
+        shell: pwsh
+        run: echo "$env:USERPROFILE\.local\bin" >> $env:GITHUB_PATH
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # mach.ps1 wraps `uv run --frozen python mach`. mach fetch downloads
+      # moztools 4.0 into servo/target/dependencies/moztools, which the
+      # SpiderMonkey build requires.
+      - name: Fetch build dependencies (moztools)
+        shell: pwsh
+        working-directory: servo
+        run: .\mach.ps1 fetch
+
+      # `medium` is defined in browser/Cargo.toml and mirrors Servo's profile:
+      # dev-like but optimised, with line-tables-only debug info. Full `dev`
+      # debug info makes a Servo target directory enormous.
+      - name: Build
+        working-directory: browser
+        run: cargo build --profile medium --locked
+
+      # Bare `cargo build` links against libEGL but leaves the DLLs in mozangle's
+      # OUT_DIR. Without this the binary cannot load. See scripts/copy-angle-dlls.ps1.
+      - name: Stage ANGLE runtime DLLs
+        shell: pwsh
+        run: .\scripts\copy-angle-dlls.ps1
+
+      - name: Verify the binary starts
+        shell: pwsh
+        run: |
+          $exe = "browser\target\medium\ferrous-browser.exe"
+          if (-not (Test-Path $exe)) { throw "binary missing: $exe" }
+          # A real GUI process cannot be meaningfully smoke-tested headlessly on a
+          # runner, so only assert the artifact and its DLL dependencies exist.
+          Write-Host "binary: $((Get-Item $exe).Length) bytes"
+          Get-ChildItem "browser\target\medium\lib*.dll" | Select-Object Name, Length
+          Write-Host "artifact present" -ForegroundColor Green
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrous-browser-windows
+          path: |
+            browser/target/medium/ferrous-browser.exe
+            browser/target/medium/libEGL.dll
+            browser/target/medium/libGLESv2.dll
+          retention-days: 7
+          if-no-files-found: error

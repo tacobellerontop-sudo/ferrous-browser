@@ -1,0 +1,10 @@
+[toolchain]
+# Pinned to match servo/rust-toolchain.toml. Servo's CI builds with this exact
+# toolchain; building the engine with a different one is untested territory.
+channel = "1.97.1"
+
+components = ["clippy", "rustfmt"]
+
+# Servo's own toolchain file additionally requests `rustc-dev` and `llvm-tools`
+# "for support/crown". We do not enable the `crown` feature, so they are omitted
+# to keep this toolchain lean. Add them here if a build error demands it.
