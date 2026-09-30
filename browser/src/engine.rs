@@ -5,7 +5,6 @@
 //! plain data back. That separation is what makes the browser logic testable
 //! without starting an engine.
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use euclid::Scale;
@@ -84,14 +83,6 @@ impl Engine {
         let _traversal_id = self.webview.go_forward(1);
     }
 
-    pub fn can_go_back(&self) -> bool {
-        self.webview.can_go_back()
-    }
-
-    pub fn can_go_forward(&self) -> bool {
-        self.webview.can_go_forward()
-    }
-
     pub fn paint(&self) {
         self.webview.paint();
     }
@@ -109,10 +100,6 @@ impl Engine {
 
     pub fn notify_input_event(&self, event: InputEvent) {
         self.webview.notify_input_event(event);
-    }
-
-    pub fn page_title(&self) -> String {
-        self.webview.page_title().unwrap_or_default()
     }
 }
 
@@ -169,21 +156,5 @@ impl WebViewDelegate for EngineDelegate {
     fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
         self.state.loading.set(status != LoadStatus::Complete);
         self.redraw.request();
-    }
-}
-
-/// Tracks the last pointer position so wheel events have somewhere to happen.
-///
-/// winit reports wheel deltas without a position, but Servo needs one.
-#[derive(Default)]
-pub struct Pointer {
-    pub x: Cell<f32>,
-    pub y: Cell<f32>,
-}
-
-impl Pointer {
-    pub fn set(&self, x: f32, y: f32) {
-        self.x.set(x);
-        self.y.set(y);
     }
 }

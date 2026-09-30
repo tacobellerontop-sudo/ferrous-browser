@@ -18,7 +18,7 @@
 //! 5. egui paints, so the toolbar composites over the page
 //! 6. `window_ctx.present()` swaps
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 
@@ -81,6 +81,9 @@ struct AppState {
     state: Rc<BrowserState>,
     engine: Engine,
     modifiers: Cell<ModifiersState>,
+    /// Last title pushed to the OS window. Guarding on this avoids calling
+    /// `SetWindowText` on every single frame, which is a syscall per frame.
+    last_window_title: RefCell<String>,
     /// Where the web view sits within the window, in egui points, recorded
     /// during layout. Cursor coordinates must be translated through this before
     /// they mean anything to Servo, because window origin != page origin.
@@ -155,6 +158,7 @@ impl ApplicationHandler<WakerEvent> for App {
             state,
             engine,
             modifiers: Cell::new(ModifiersState::default()),
+            last_window_title: RefCell::new(String::new()),
             content_rect: Cell::new(None),
             last_page_point: Cell::new(WebViewPoint::Device(DevicePoint::new(0.0, 0.0))),
         }));
@@ -238,6 +242,7 @@ fn draw_frame(app: &mut AppState) {
         state,
         window,
         content_rect,
+        last_window_title,
         ..
     } = app;
 
@@ -263,6 +268,17 @@ fn draw_frame(app: &mut AppState) {
 
         // Keep the page from stealing keys while the user is typing in the bar.
         engine.set_focused(!state.address_focused.get());
+
+        // Reflect the page title in the OS window title bar, but only when it
+        // actually changed: `set_title` is a syscall and this runs every frame.
+        let page_title = state.title.borrow().clone();
+        if !page_title.is_empty() {
+            let mut last = last_window_title.borrow_mut();
+            if *last != page_title {
+                window.set_title(&format!("{page_title} - Ferrous"));
+                *last = page_title.clone();
+            }
+        }
 
         // Blit the page into the window, underneath everything egui draws. The
         // background layer is painted first, so the toolbar composites on top.
@@ -294,7 +310,7 @@ fn draw_frame(app: &mut AppState) {
     app.window_ctx.present();
 }
 
-fn apply_action(engine: &Engine, chrome: &mut Chrome, state: &BrowserState, action: Action) {
+fn apply_action(engine: &Engine, _chrome: &mut Chrome, state: &BrowserState, action: Action) {
     match action {
         Action::Navigate(input) => {
             let url = address::resolve(&input);
@@ -304,7 +320,6 @@ fn apply_action(engine: &Engine, chrome: &mut Chrome, state: &BrowserState, acti
         Action::Back => engine.go_back(),
         Action::Forward => engine.go_forward(),
         Action::Reload => engine.reload(),
-        Action::FocusAddressBar => chrome.request_focus_address_bar(),
     }
 }
 

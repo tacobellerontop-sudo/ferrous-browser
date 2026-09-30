@@ -658,3 +658,82 @@ URL. That split is unit tested.
 | URL passthrough (typed URL) | unit tested, not clicked by hand |
 | Keyboard reaching page content | still unverified |
 | Resize handling | still unverified |
+
+---
+
+## 2026-09-30 — Entry 007: QoL pass (select-all, escape, spinner, title)
+
+### What changed
+
+Four additions, all driven by state the browser **already tracked** and none
+adding a dependency:
+
+1. **Select-all when the address bar gains focus**, so typing replaces the URL
+   instead of appending to it.
+2. **Escape abandons an edit** and restores the address of the page actually
+   loaded.
+3. **Loading spinner** in the toolbar, bound to `notify_load_status_changed`.
+4. **Window title reflects the page title** (`<title> - Ferrous`).
+
+Plus a safety net: losing focus without pressing Enter restores the real address,
+so the bar never displays text the browser is not actually on.
+
+Dead code found by the compiler and removed rather than kept: `Action::FocusAddressBar`
+(never constructed — Ctrl+L calls `Chrome::request_focus_address_bar` directly),
+`Engine::can_go_back`/`can_go_forward`/`page_title` (superseded by the delegate's
+history events), and the unused `engine::Pointer` struct.
+
+### Problems encountered and how they were solved
+
+**P28. Select-all initially only worked for Ctrl+L, not for clicks.** The first
+implementation armed `select_all_pending` inside the `request_focus_address_bar`
+path, so a plain mouse click — which reaches egui's own focus handling and never
+calls our request — never selected anything. Typing appended.
+
+Verified by screenshot: address bar read `https://servo.org/z` instead of `z`.
+
+Fixed by detecting the focus-*gained* **edge** (`focused && !focused_last_frame`)
+rather than driving it from the focus request. Now `text="z"` after typing one
+character — the URL is genuinely replaced.
+
+**P29. egui 0.34.3 has no `select_all_on_focus`.** The full `TextEdit` option
+list was enumerated to confirm this; the selection has to be set through the
+widget's public `TextEdit::load_state` / `store_state` plus
+`TextCursorState::set_char_range(CCursorRange::two(..))`.
+
+This required giving the field an **explicit** `Id`, because `load_state` needs
+to find the same widget the TextEdit uses and an auto-generated id drifts as the
+surrounding layout changes.
+
+Footgun worth remembering: `CCursor` indexes by **character**, not byte. Using
+`str::len()` panics on any non-ASCII URL, so the count is taken with `chars()`.
+
+**P30. `desired_width(f32::INFINITY)` starved the spinner of width.** The
+address field claimed the whole toolbar row, leaving the indicator zero width,
+so it could never have been seen. Replaced with `ui.add_sized([available - 24, 22])`,
+reserving a slot.
+
+**P31. `Context::screen_rect()` is deprecated** in favour of `content_rect()`
+(egui 0.34 deprecation notice: *"screen_rect has been split into viewport_rect()
+and content_rect()"*). Switched; `content_rect()` is also the semantically
+correct one for "the area actually available to draw in".
+
+### Verified
+
+- Select-all on focus: typed one character, `text="z"` (was
+  `https://servo.org/z`).
+- Escape: text reverted to `https://servo.org/`, focus surrendered.
+- Window title: `Wikipedia - Ferrous`, then
+  `Servo aims to empower developers... - Ferrous`.
+- Ctrl+L + select-all + URL entry navigates to a **URL** (wikipedia.org), not a
+  search — confirming `address::resolve`'s scheme-passthrough branch.
+- Search entry still routes to DuckDuckGo.
+- Address bar now reserves trailing space for the indicator.
+- 9 unit tests pass; smoke test clean; no warnings from our own crate.
+
+### NOT verified
+
+- **The spinner was never caught in a screenshot.** Every page tested loaded
+  faster than the capture. The layout fix is confirmed (the field visibly ends
+  short of the row), and the binding is one line, but the rendered spinner
+  itself is unconfirmed. Worth a glance on a slow connection.
