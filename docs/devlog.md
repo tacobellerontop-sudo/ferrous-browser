@@ -736,4 +736,163 @@ correct one for "the area actually available to draw in".
 - **The spinner was never caught in a screenshot.** Every page tested loaded
   faster than the capture. The layout fix is confirmed (the field visibly ends
   short of the row), and the binding is one line, but the rendered spinner
-  itself is unconfirmed. Worth a glance on a slow connection.
+  itself is unconfirmed. Worth a glance on a slow connection.---
+
+## 2026-09-30 — Entry 008: Smooth scrolling and a custom frameless title bar
+
+### What changed
+
+- `browser/src/scroll.rs` — **new.** `SmoothScroll`, an engine-free, unit-tested
+  exponential-decay animation, plus `scroll_delta_from_wheel`.
+- `browser/src/titlebar.rs` — **new.** Title-bar drawing, resize-border hit
+  testing, and the Win32 interop.
+- `browser/src/icons.rs` — **new.** Hand-painted icons for both the window
+  controls and the navigation buttons.
+- `browser/src/chrome.rs` — nav buttons are now painted shapes, not text glyphs.
+- `browser/src/engine.rs` — added `notify_scroll_event`.
+- `browser/src/main.rs` — `with_decorations(false)`, title-bar panel, scroll
+  pump, resize-border routing, `hwnd` extraction, `seen_url` navigation check.
+
+### Why
+
+Two requests: smooth scrolling, and replace the OS title bar. Neither exists in
+Servo or winit, so both had to be built.
+
+### Servo APIs verified (read from source)
+
+| Fact | Location |
+| --- | --- |
+| `Scroll` has only `Delta`/`Start`/`End` — **no animated variant** | `components/shared/embedder/lib.rs:173` |
+| There is **no `smooth_scroll` preference anywhere in Servo** | grep over `components/` returns nothing |
+| `WebView::notify_scroll_event(&self, Scroll, WebViewPoint)` | `components/servo/webview.rs:603` |
+| `Scroll::Delta(WebViewVector)`, and `WebViewVector::Device(DeviceVector2D)` | `components/shared/embedder/lib.rs:138` |
+| **"A scroll delta for a wheel event is the inverse of the wheel delta."** | `components/paint/webview_renderer.rs:1219-1222` |
+| servoshell sets `with_decorations(false)` but implements **no** window dragging or controls | `ports/servoshell/desktop/headed_window.rs:114-124` |
+
+So smooth scrolling is ours to build, and servoshell gives no reference for the
+frameless window.
+
+### winit 0.30.13 gaps (why Win32 interop is unavoidable)
+
+Checked directly in the winit source:
+
+- **No** `Window::start_drag`
+- **No** `Window::begin_resize_drag`
+- **No** `maximize` / `unmaximize` — only `is_maximized() -> bool`
+- **No** `Window::close()` at all, not under any name
+
+A frameless window without those is a window the user cannot move, resize,
+maximise or close. That is worse than keeping the native title bar, so the drag,
+the edge resize and the maximise/restore are handed back to Windows with
+`ReleaseCapture` + `SendMessageW(WM_NCLBUTTONDOWN, HT*)`. Windows then runs its
+own modal loop, which keeps edge snapping, Aero Shake and double-click-to-maximise
+working — none of which a hand-rolled "track the cursor, call `set_outer_position`"
+loop gets right.
+
+Closing is the exception: with no `Window::close`, the close button sets a flag
+that `draw_frame` returns, and `window_event` calls `event_loop.exit()`.
+
+### This is the project's first `unsafe`
+
+One block, confined to `titlebar.rs::platform`, genuine platform interop rather
+than a type-erasure workaround: three `extern "system"` declarations and one
+`GetCursorPos`. Every call site carries its own `SAFETY` note, and the Win32
+constants (`WM_NCLBUTTONDOWN = 161`, `HTLEFT = 10` … `HTBOTTOMRIGHT = 17`,
+`SW_MAXIMIZE = 3`, `SW_RESTORE = 9`) were read out of `windows-sys 0.45.0` in the
+registry rather than written from memory.
+
+### Problems hit
+
+**P32. The smooth-scroll tests caught the implementation, not the reverse.**
+They asserted the full queued distance was delivered; the implementation
+deliberately discards a sub-pixel tail so the exponential decay terminates.
+The tests were wrong, not the code — an animation that eases forever would keep
+waking the event loop indefinitely, which is precisely the idle-CPU cost this
+project is trying to avoid. Rewrote the tests to state the real contract.
+
+**P33. egui's bundled font has no Arrows, Geometric Shapes or Dingbats.**
+`Button::new("\u{2190}")` renders as a `.notdef` tofu box. Discovered by zooming
+into a screenshot: the window controls and the *pre-existing* navigation buttons
+were all unreadable squares. Every icon is now painted with `egui::Painter`,
+which also makes them DPI-crisp and avoids shipping a font for six shapes.
+
+**P34. `ui.horizontal` inserts item spacing between widgets.** The title bar
+reserved `3 * BUTTON_WIDTH` for the controls but the layout spent
+`3 * BUTTON_WIDTH + 2 * spacing`, pushing Close off the right edge — visible only
+after zooming into the corner. Fixed by zeroing `item_spacing.x` inside the
+title bar's own `Ui`.
+
+**P35. Window controls were in reverse order.** `ui.horizontal` lays out in array
+order, so iterating `[Close, Maximize, Minimize]` produced close-maximize-minimize.
+Windows convention is minimize, maximize, close.
+
+**P36. `resize_edge_at` had no bounds check.** A point to the *left* of the
+window has a *negative* distance to the right edge, which satisfies
+`<= RESIZE_BORDER` and was reported as a right-edge resize. winit reports cursor
+positions relative to the client area, and those fall outside it during a drag.
+Added an explicit bounds check plus a regression test.
+
+**P37. `lParam` must carry the real cursor position.** Sending `0` looks
+harmless and a *bottom*-edge resize even works, but Windows validates the point
+against the window bounds — with `0, 0` a left, right or caption drag is
+silently discarded while bottom still goes through. This asymmetry is what made
+it look like "some edges work". Fixed by packing `GetCursorPos` into an LPARAM.
+
+**P38. Scrolling was silently inverted.** The single worst bug of the entry.
+Servo negates the wheel delta internally
+(`components/paint/webview_renderer.rs:1219-1222`); passing winit's value
+straight through scrolled every page the *wrong way*. Because the start page is
+already at the top, the symptom was "scrolling does nothing" — which looks like
+a missing feature rather than a sign error. Only found by screenshotting before
+and after. Fixed in `scroll::scroll_delta_from_wheel`, with four tests that
+encode the convention so it cannot regress silently.
+
+**P39. egui API details that differ from the obvious guess.**
+`Ui::allocate_exact_size` returns `(Rect, Response)` in egui 0.34, not
+`(Response, Rect)`. `Painter::rect_stroke` takes a fourth `StrokeKind` argument.
+`Response::on_hover_text` *consumes* the `Response` and returns an `Option`, so
+the click test must happen before it. Edition 2024 requires `unsafe extern`
+blocks.
+
+**P40. `Panel::top` + `Panel::top` leave no gap**, so drawing the title-bar panel
+before the toolbar panel is sufficient to push the content rectangle below both —
+no manual offset arithmetic needed.
+
+### Verified on screen
+
+- Title bar shows the page `<title>`, with minimize / maximize / close painted,
+  in the correct order, inside the window bounds. Maximised state switches the
+  middle glyph to the restore form.
+- **Maximize** button maximises (`IsZoomed` true, 1936x1048).
+- **Restore** button restores (1100x820).
+- **Minimize** button minimises (`IsIconic` true).
+- **Close** button exits the process cleanly.
+- **Title-bar drag** moves the window.
+- **Left, top and bottom** edge resize all move the correct edge.
+- Navigation buttons (back / forward / reload) are now legible painted arrows.
+- **Smooth scrolling** works and goes the right way: 8 notches down scrolls well
+  down the page, 14 notches up returns to the top.
+- **Idle CPU is 0 ms over an 8-second window** — the `is_animating()` guard
+  means the event loop is not kept awake after a glide finishes.
+- Working set 174 MB. 28 unit tests pass. No warnings from our crate.
+
+### NOT verified — needs a human
+
+- **Right-edge resize.** It behaved inconsistently under synthetic input: two
+  attempts produced two *different* wrong answers (once the left edge followed,
+  once both edges shifted). Left, top, bottom and the caption drag all pass
+  through the identical `send_non_client` path, so the mechanism is sound, but
+  the right edge specifically could not be confirmed. Suspect the test harness
+  rather than the code: the drag is synthesised with `SetCursorPos` *inside*
+  Windows' own modal loop, which is not how a real mouse behaves. **Must be
+  checked with a real mouse before this is called done.**
+
+- Smooth scrolling has been verified as *functional and correctly directed*, but
+  not *judged as feeling smooth* — that needs a human hand on a real wheel, and
+  ideally a trackpad, since `PixelDelta` and `LineDelta` take different paths.
+
+### Still open from earlier entries
+
+- Loading spinner never caught in a screenshot (P30/layout confirmed only).
+- Keyboard input reaching page content never confirmed with a text field.
+- `Opts::default().multiprocess` is still `false`; cross-process paint untested.

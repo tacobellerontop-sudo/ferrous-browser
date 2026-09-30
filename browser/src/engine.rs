@@ -10,8 +10,8 @@ use std::rc::Rc;
 use euclid::Scale;
 use log::info;
 use servo::{
-    EventLoopWaker, InputEvent, LoadStatus, RenderingContext, Servo, ServoBuilder, WebView,
-    WebViewBuilder, WebViewDelegate,
+    EventLoopWaker, InputEvent, LoadStatus, RenderingContext, Scroll, Servo, ServoBuilder, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use url::Url;
 use winit::window::Window;
@@ -100,6 +100,17 @@ impl Engine {
 
     pub fn notify_input_event(&self, event: InputEvent) {
         self.webview.notify_input_event(event);
+    }
+
+    /// Scroll the page by a device-pixel delta.
+    ///
+    /// This is separate from `InputEvent::Wheel` because Servo has no notion of
+    /// an animated wheel: `Scroll` only offers `Delta`/`Start`/`End`
+    /// (components/shared/embedder/lib.rs:173), so each call moves the page one
+    /// instantaneous step. [`crate::scroll::SmoothScroll`] turns one wheel notch
+    /// into a short sequence of these.
+    pub fn notify_scroll_event(&self, scroll: Scroll, point: WebViewPoint) {
+        self.webview.notify_scroll_event(scroll, point);
     }
 }
 

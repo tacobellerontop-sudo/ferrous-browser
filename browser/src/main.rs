@@ -20,18 +20,20 @@
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
+use std::ffi::c_void;
 use std::rc::Rc;
+use std::time::Instant;
 
-use egui::{LayerId, PaintCallback, Rect};
+use egui::{LayerId, PaintCallback, Panel, Rect};
 use egui_glow::EguiGlow;
 // euclid geometry, aliased so it is not confused with `egui::Rect` — the blit
 // callback needs the integer, bottom-left-origin flavour.
 use euclid::{Point2D as EuclidPoint, Rect as EuclidRect, Size2D as EuclidSize};
 use log::{error, info};
 use servo::{
-    Code, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, Location, Modifiers,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
-    OffscreenRenderingContext, RenderingContext, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    Code, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
+    OffscreenRenderingContext, RenderingContext, Scroll, WebViewPoint, WebViewVector,
     WindowRenderingContext,
 };
 use url::Url;
@@ -47,10 +49,14 @@ mod address;
 mod browser_state;
 mod chrome;
 mod engine;
+mod icons;
+mod scroll;
+mod titlebar;
 
 use browser_state::BrowserState;
 use chrome::{Action, Chrome};
 use engine::Engine;
+use scroll::SmoothScroll;
 
 /// servoshell uses the same value (ports/servoshell/window.rs:25-27).
 const SCROLL_LINE_HEIGHT: f64 = 76.0;
@@ -91,6 +97,23 @@ struct AppState {
     /// Last cursor position expressed in web-view coordinates. winit reports
     /// wheel deltas without any position, so the most recent one is reused.
     last_page_point: Cell<WebViewPoint>,
+    /// Native handle, needed for the frameless-window interop in [`titlebar`].
+    hwnd: Cell<*mut c_void>,
+    /// Smooth-scroll animation state. Drives redraws only while it is active.
+    scroll: SmoothScroll,
+    /// Start of the current frame, used to give [`SmoothScroll::step`] a real
+    /// delta time. Frame-count-based animation would run 2.4x fast at 144Hz.
+    frame_started: Instant,
+    /// Mirrors the window's maximised state so the title bar can pick its glyph.
+    /// winit can report `is_maximized` but cannot change it.
+    maximized: Cell<bool>,
+    /// Cursor position in egui points within the window, used only for the
+    /// frameless resize-border hit test.
+    cursor: Cell<Option<egui::Pos2>>,
+    /// Last URL observed by the frame loop, so a navigation can be detected from
+    /// one string comparison instead of threading a flag from every navigation
+    /// site (toolbar, link click, redirect, history).
+    seen_url: RefCell<String>,
 }
 
 enum App {
@@ -118,13 +141,26 @@ impl ApplicationHandler<WakerEvent> for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("Ferrous")
-                        .with_inner_size(PhysicalSize::new(1100, 820)),
+                        .with_inner_size(PhysicalSize::new(1100, 820))
+                        // Frameless: `titlebar` draws the bar and supplies the
+                        // drag/resize/control behaviour winit is missing.
+                        .with_decorations(false),
                 )
                 .expect("failed to create window"),
         );
         let window_handle = window
             .window_handle()
             .expect("window must expose a window handle");
+
+        // Needed by the frameless-window interop; winit only hands this out
+        // through the raw window handle trait.
+        let hwnd = {
+            use winit::raw_window_handle::{RawWindowHandle, Win32WindowHandle};
+            let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) = window_handle.as_raw() else {
+                unreachable!("this browser is Windows-only; no HWND available");
+            };
+            hwnd.get() as *mut c_void
+        };
 
         let window_ctx = Rc::new(
             WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
@@ -161,6 +197,12 @@ impl ApplicationHandler<WakerEvent> for App {
             last_window_title: RefCell::new(String::new()),
             content_rect: Cell::new(None),
             last_page_point: Cell::new(WebViewPoint::Device(DevicePoint::new(0.0, 0.0))),
+            hwnd: Cell::new(hwnd),
+            scroll: SmoothScroll::default(),
+            frame_started: Instant::now(),
+            maximized: Cell::new(false),
+            cursor: Cell::new(None),
+            seen_url: RefCell::new(String::new()),
         }));
     }
 
@@ -193,12 +235,43 @@ impl ApplicationHandler<WakerEvent> for App {
                 app.modifiers.set(changed.state());
                 return;
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                app.cursor.set(Some(to_window_points(app, position)));
+            }
+            // The user can maximise or restore from outside our buttons (Win+Up,
+            // dragging the window to a screen edge, double-clicking the bar), so
+            // the tracked state is refreshed rather than assumed.
+            WindowEvent::Resized(_) => {
+                let maximized_now = app.window.is_maximized();
+                if app.maximized.get() != maximized_now {
+                    app.maximized.set(maximized_now);
+                    app.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
-                draw_frame(app);
+                let close_requested = draw_frame(app);
                 app.engine.spin();
+                if close_requested {
+                    event_loop.exit();
+                }
                 return;
             }
             _ => {}
+        }
+
+        // Resize border of the frameless window. Checked before egui and before
+        // the page, because there is no widget out there — and it must lose to
+        // the title-bar drag, which sits just inside the top border. Returning
+        // early also suppresses the release event, which Windows consumes as
+        // part of its own modal resize loop.
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if *state == ElementState::Pressed
+                && *button == WinitMouseButton::Left
+                && begin_resize(app)
+            {
+                app.engine.spin();
+                return;
+            }
         }
 
         // Browser shortcuts are policy, so they are matched before egui — which
@@ -226,29 +299,63 @@ impl ApplicationHandler<WakerEvent> for App {
 
 /// One full frame: chrome layout, Servo paint, blit, present.
 ///
+/// Returns true when the user closed the window from the custom title bar.
+/// winit 0.30 has no `Window::close`, so the request is carried back up to
+/// `window_event`, which owns the `ActiveEventLoop` needed to exit.
+///
 /// The fields are destructured first so that `egui` can be borrowed mutably at
 /// the same time as `engine` and `chrome` — they are disjoint fields, and
 /// destructuring is what tells the borrow checker so.
-fn draw_frame(app: &mut AppState) {
+fn draw_frame(app: &mut AppState) -> bool {
     app.offscreen_ctx
         .make_current()
         .expect("make offscreen context current");
+
+    // Frame delta for the smooth-scroll animation. Sampled before destructuring
+    // so the timestamp can be both read and reset in one place.
+    let now = Instant::now();
+    let dt = now.duration_since(app.frame_started);
+    app.frame_started = now;
+
+    // Title-bar commands are collected during the frame but executed *after*
+    // `present()`. `SendMessageW(WM_NCLBUTTONDOWN, ...)` opens a modal Windows
+    // drag loop that blocks until the gesture ends; running it inside the egui
+    // closure would re-enter the event loop with egui's borrow stack half
+    // unwound.
+    let mut window_commands: Vec<titlebar::WindowCommand> = Vec::new();
 
     let AppState {
         egui,
         engine,
         chrome,
         offscreen_ctx,
-        state,
+        state: browser,
         window,
         content_rect,
         last_window_title,
+        last_page_point,
+        scroll,
+        maximized,
+        seen_url,
         ..
     } = app;
 
     // `window` is an `Rc<Window>`; deref coercion hands egui the `&Window` it
     // wants without a clone (winit 0.30's Window is not Clone).
     egui.run(&window, |ui| {
+        // Title bar first, so the toolbar panel lays out beneath it and the
+        // content rectangle reported by the chrome ends up below both.
+        let frame = egui::Frame::new().fill(ui.visuals().panel_fill);
+        Panel::top("titlebar").frame(frame).show_inside(ui, |ui| {
+            let page_title = browser.title.borrow().clone();
+            let label = if page_title.is_empty() {
+                "Ferrous".to_owned()
+            } else {
+                page_title
+            };
+            window_commands.extend(titlebar::draw(ui, &label, maximized.get()));
+        });
+
         let output = chrome.draw(ui);
         content_rect.set(Some(output.content_rect));
 
@@ -262,16 +369,35 @@ fn draw_frame(app: &mut AppState) {
         // Servo renders into the offscreen framebuffer here.
         engine.paint();
 
+        // Drop an in-flight glide when the page changes. Scrolling the momentum
+        // of the page the user just left onto the page they just opened reads as
+        // a glitch, and the new document usually starts at the top anyway.
+        {
+            let current = browser.url.borrow().clone();
+            if *seen_url.borrow() != current {
+                scroll.cancel();
+                *seen_url.borrow_mut() = current;
+            }
+        }
+
+        // Deliver one slice of any in-flight wheel glide.
+        if let Some(delta) = scroll.step(dt) {
+            engine.notify_scroll_event(
+                Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(delta.x, delta.y))),
+                last_page_point.get(),
+            );
+        }
+
         for action in output.actions {
-            apply_action(engine, chrome, state, action);
+            apply_action(engine, chrome, browser, action);
         }
 
         // Keep the page from stealing keys while the user is typing in the bar.
-        engine.set_focused(!state.address_focused.get());
+        engine.set_focused(!browser.address_focused.get());
 
         // Reflect the page title in the OS window title bar, but only when it
         // actually changed: `set_title` is a syscall and this runs every frame.
-        let page_title = state.title.borrow().clone();
+        let page_title = browser.title.borrow().clone();
         if !page_title.is_empty() {
             let mut last = last_window_title.borrow_mut();
             if *last != page_title {
@@ -304,10 +430,62 @@ fn draw_frame(app: &mut AppState) {
         }
     });
 
+    // Keep the loop awake only while a glide is actually in flight. Without this
+    // the easing tail would stall; without the `is_animating` guard the browser
+    // would spin at full frame rate while idle, which is exactly the cost this
+    // project is trying to avoid.
+    if app.scroll.is_animating() {
+        app.window.request_redraw();
+    }
+
     // Draw the window surface and swap.
     app.window_ctx.prepare_for_rendering();
     app.egui.paint(&app.window);
     app.window_ctx.present();
+
+    for command in window_commands {
+        if apply_window_command(app, command) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Carry out a window (not page) command. Called after `present` because the
+/// drag and resize paths enter a modal Windows loop and must not run while egui
+/// is mid-frame.
+///
+/// Returns true when the caller should shut the event loop down.
+fn apply_window_command(app: &AppState, command: titlebar::WindowCommand) -> bool {
+    let hwnd = app.hwnd.get();
+    match command {
+        titlebar::WindowCommand::DragTitleBar => titlebar::drag_title_bar(hwnd),
+        titlebar::WindowCommand::Minimize => app.window.set_minimized(true),
+        titlebar::WindowCommand::ToggleMaximize => {
+            let next = !app.maximized.get();
+            titlebar::set_maximized(hwnd, next);
+            app.maximized.set(next);
+        }
+        titlebar::WindowCommand::Close => return true,
+    }
+    false
+}
+
+/// If the cursor is on the frameless resize border, start a native resize and
+/// report that the event was consumed.
+fn begin_resize(app: &AppState) -> bool {
+    // A maximised window has no edges to grab; the border would just confuse.
+    if app.maximized.get() {
+        return false;
+    }
+    let Some(pos) = app.cursor.get() else {
+        return false;
+    };
+    let Some(edge) = titlebar::resize_edge_at(pos, app.egui.egui_ctx.content_rect()) else {
+        return false;
+    };
+    titlebar::resize(app.hwnd.get(), edge);
+    true
 }
 
 fn apply_action(engine: &Engine, _chrome: &mut Chrome, state: &BrowserState, action: Action) {
@@ -377,7 +555,7 @@ fn handle_shortcut(
 }
 
 /// Route an input event to the web page, translating out of the toolbar area.
-fn forward_to_page(app: &AppState, event: &WindowEvent) {
+fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
     match event {
         WindowEvent::CursorMoved { position, .. } => {
             let point = to_page(app, *position);
@@ -399,24 +577,31 @@ fn forward_to_page(app: &AppState, event: &WindowEvent) {
         }
         WindowEvent::MouseWheel { delta, .. } => {
             // winit gives f32 line deltas; Servo's WheelDelta is f64.
-            let (x, y, mode) = match *delta {
+            let (x, y) = match *delta {
                 MouseScrollDelta::LineDelta(dx, dy) => (
                     f64::from(dx) * SCROLL_LINE_HEIGHT,
                     f64::from(dy) * SCROLL_LINE_HEIGHT,
-                    WheelMode::DeltaLine,
                 ),
-                MouseScrollDelta::PixelDelta(p) => (p.x, p.y, WheelMode::DeltaPixel),
+                MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
             };
-            app.engine
-                .notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                    WheelDelta {
-                        x,
-                        y,
-                        z: 0.0,
-                        mode,
-                    },
+
+            // Queued for animation rather than sent as `InputEvent::Wheel`. A
+            // wheel event is one instantaneous jump in Servo, which is what
+            // makes native scrolling feel like a series of hops.
+            //
+            // `scroll_delta_from_wheel` inverts the sign; see the note there.
+            // Passing winit's value straight through scrolls the page backwards.
+            let delta = scroll::scroll_delta_from_wheel(x, y);
+            if app.scroll.push(delta) {
+                app.window.request_redraw();
+            } else {
+                // Too small to be worth a 200ms glide, so pass it straight
+                // through and the scroll lands on this very frame.
+                app.engine.notify_scroll_event(
+                    Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(delta.x, delta.y))),
                     last_page_point(app),
-                )));
+                );
+            }
         }
         WindowEvent::KeyboardInput { event, .. } => {
             // Never steal keys while the address bar has them.
@@ -441,13 +626,20 @@ fn to_page(app: &AppState, position: PhysicalPosition<f64>) -> WebViewPoint {
         return WebViewPoint::Device(DevicePoint::new(0.0, 0.0));
     };
 
-    // egui points are top-left origin; window positions are in physical pixels.
-    let ppp = app.egui.egui_ctx.pixels_per_point();
-    let (wx, wy) = (position.x / ppp as f64, position.y / ppp as f64);
-    let x = (wx - rect.min.x as f64) as f32;
-    let y = (wy - rect.min.y as f64) as f32;
+    let pos = to_window_points(app, position);
+    WebViewPoint::Device(DevicePoint::new(
+        pos.x - rect.min.x,
+        pos.y - rect.min.y,
+    ))
+}
 
-    WebViewPoint::Device(DevicePoint::new(x, y))
+/// Window-space cursor position in egui points (top-left origin).
+fn to_window_points(app: &AppState, position: PhysicalPosition<f64>) -> egui::Pos2 {
+    let ppp = app.egui.egui_ctx.pixels_per_point() as f64;
+    egui::pos2(
+        (position.x / ppp) as f32,
+        (position.y / ppp) as f32,
+    )
 }
 
 /// Wheel events need a position but winit reports none, so the last known cursor

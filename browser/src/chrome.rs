@@ -7,10 +7,11 @@ use std::rc::Rc;
 
 use egui::text::CCursor;
 use egui::{
-    Align, Button, Id, Panel, Rect, Spinner, TextEdit, Ui, text_selection::CCursorRange,
+    Align, Id, Panel, Rect, Sense, Spinner, TextEdit, Ui, text_selection::CCursorRange,
 };
 
 use crate::browser_state::BrowserState;
+use crate::icons;
 
 /// Stable id for the address field. Explicit rather than auto-generated so that
 /// [`TextEdit::load_state`] can find the widget's state and select its text;
@@ -20,6 +21,10 @@ const ADDRESS_BAR_ID: fn() -> Id = || Id::new("ferrous.address_bar");
 /// Horizontal space kept free at the end of the toolbar row for the loading
 /// indicator.
 const SPINNER_SLOT: f32 = 24.0;
+
+/// Clickable size of each navigation icon.
+const BUTTON: f32 = 24.0;
+const ICON_BUTTON: f32 = 22.0;
 
 /// Something the user asked for by clicking or typing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,30 +102,46 @@ impl Chrome {
     }
 
     fn nav_buttons(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        // Buttons are disabled rather than hidden when unavailable: a button
-        // that appears and disappears makes the toolbar jump around, and
-        // disabled buttons still explain themselves via a tooltip.
-        if ui
-            .add_enabled(self.state.can_go_back.get(), Button::new("\u{2190}"))
-            .on_hover_text("Back")
-            .clicked()
-        {
+        let size = egui::vec2(BUTTON, ICON_BUTTON);
+        let (back, back_response) = ui.allocate_exact_size(size, Sense::click());
+        let (forward, forward_response) = ui.allocate_exact_size(size, Sense::click());
+        let (reload, reload_response) = ui.allocate_exact_size(size, Sense::click());
+
+        // Disabled rather than hidden: a button that appears and disappears
+        // makes the toolbar jump around, and a dimmed one still says "Back"
+        // in its tooltip.
+        let on = ui.visuals().weak_text_color();
+        let off = icons::dim(on);
+        let (back_on, forward_on) = (self.state.can_go_back.get(), self.state.can_go_forward.get());
+
+        let painter = ui.painter().clone();
+        icons::back(&painter, back.center(), if back_on { on } else { off });
+        icons::forward(&painter, forward.center(), if forward_on { on } else { off });
+        icons::reload(&painter, reload.center(), on);
+
+        // `on_hover_text` consumes the `Response`, so the click and hover tests
+        // have to happen first.
+        let (back_hit, forward_hit, reload_hit) = (
+            back_on && back_response.clicked(),
+            forward_on && forward_response.clicked(),
+            reload_response.clicked(),
+        );
+        for response in [&back_response, &forward_response, &reload_response] {
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        let _ = back_response.on_hover_text("Back");
+        let _ = forward_response.on_hover_text("Forward");
+        let _ = reload_response.on_hover_text("Reload");
+
+        if back_hit {
             actions.push(Action::Back);
         }
-
-        if ui
-            .add_enabled(self.state.can_go_forward.get(), Button::new("\u{2192}"))
-            .on_hover_text("Forward")
-            .clicked()
-        {
+        if forward_hit {
             actions.push(Action::Forward);
         }
-
-        if ui
-            .add_enabled(true, Button::new("\u{21BB}"))
-            .on_hover_text("Reload")
-            .clicked()
-        {
+        if reload_hit {
             actions.push(Action::Reload);
         }
 
