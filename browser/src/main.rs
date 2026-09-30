@@ -107,6 +107,12 @@ struct AppState {
     /// Mirrors the window's maximised state so the title bar can pick its glyph.
     /// winit can report `is_maximized` but cannot change it.
     maximized: Cell<bool>,
+    /// True while a modal Windows drag or resize loop is on the stack.
+    ///
+    /// Those loops pump messages, so a second press can arrive while the first
+    /// is still running. Starting a nested loop is what produced the runaway
+    /// CPU spin, so the guard is a hard stop rather than a nicety.
+    modal_gesture: Cell<bool>,
     /// Cursor position in egui points within the window, used only for the
     /// frameless resize-border hit test.
     cursor: Cell<Option<egui::Pos2>>,
@@ -201,6 +207,7 @@ impl ApplicationHandler<WakerEvent> for App {
             scroll: SmoothScroll::default(),
             frame_started: Instant::now(),
             maximized: Cell::new(false),
+            modal_gesture: Cell::new(false),
             cursor: Cell::new(None),
             seen_url: RefCell::new(String::new()),
         }));
@@ -259,18 +266,20 @@ impl ApplicationHandler<WakerEvent> for App {
             _ => {}
         }
 
-        // Resize border of the frameless window. Checked before egui and before
-        // the page, because there is no widget out there — and it must lose to
-        // the title-bar drag, which sits just inside the top border. Returning
-        // early also suppresses the release event, which Windows consumes as
-        // part of its own modal resize loop.
+        // Frameless-window gestures: resize border, then title-bar drag. Both are
+        // handled here, before egui and before the page, because there is no
+        // widget out there — and both block in a modal Windows loop, so they must
+        // not be deferred into a frame.
+        //
+        // Returning early also swallows the mouse-up event, which Windows
+        // consumes as part of its own modal loop.
         if let WindowEvent::MouseInput { state, button, .. } = &event {
-            if *state == ElementState::Pressed
-                && *button == WinitMouseButton::Left
-                && begin_resize(app)
-            {
-                app.engine.spin();
-                return;
+            if *state == ElementState::Pressed && *button == WinitMouseButton::Left {
+                let started = begin_resize(app) || begin_title_bar_drag(app);
+                if started {
+                    app.engine.spin();
+                    return;
+                }
             }
         }
 
@@ -345,7 +354,15 @@ fn draw_frame(app: &mut AppState) -> bool {
     egui.run(&window, |ui| {
         // Title bar first, so the toolbar panel lays out beneath it and the
         // content rectangle reported by the chrome ends up below both.
-        let frame = egui::Frame::new().fill(ui.visuals().panel_fill);
+        //
+        // Zero inner margin is load-bearing: `titlebar::is_in_drag_area` hit
+        // tests against `drag_rect`, which assumes the painted strip starts at
+        // the window origin. With egui's default 8pt margin the two would
+        // disagree by 8pt and presses would land slightly off.
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .inner_margin(egui::Margin::ZERO)
+            .outer_margin(egui::Margin::ZERO);
         Panel::top("titlebar").frame(frame).show_inside(ui, |ui| {
             let page_title = browser.title.borrow().clone();
             let label = if page_title.is_empty() {
@@ -451,15 +468,11 @@ fn draw_frame(app: &mut AppState) -> bool {
     false
 }
 
-/// Carry out a window (not page) command. Called after `present` because the
-/// drag and resize paths enter a modal Windows loop and must not run while egui
-/// is mid-frame.
-///
-/// Returns true when the caller should shut the event loop down.
+/// Carry out a window (not page) command. None of these block, so unlike the
+/// drag they can safely be deferred to the end of the frame.
 fn apply_window_command(app: &AppState, command: titlebar::WindowCommand) -> bool {
     let hwnd = app.hwnd.get();
     match command {
-        titlebar::WindowCommand::DragTitleBar => titlebar::drag_title_bar(hwnd),
         titlebar::WindowCommand::Minimize => app.window.set_minimized(true),
         titlebar::WindowCommand::ToggleMaximize => {
             let next = !app.maximized.get();
@@ -469,6 +482,20 @@ fn apply_window_command(app: &AppState, command: titlebar::WindowCommand) -> boo
         titlebar::WindowCommand::Close => return true,
     }
     false
+}
+
+/// Run `gesture`, a modal Windows drag-or-resize loop, exactly once at a time.
+///
+/// `WM_NCLBUTTONDOWN` does not return until the gesture ends, and pumps messages
+/// while it waits. Guarding re-entry here is what keeps one drag from becoming an
+/// unbounded nest of them.
+fn run_modal_gesture<T>(app: &AppState, gesture: impl FnOnce() -> T) -> Option<T> {
+    if app.modal_gesture.replace(true) {
+        return None;
+    }
+    let result = gesture();
+    app.modal_gesture.set(false);
+    Some(result)
 }
 
 /// If the cursor is on the frameless resize border, start a native resize and
@@ -484,7 +511,35 @@ fn begin_resize(app: &AppState) -> bool {
     let Some(edge) = titlebar::resize_edge_at(pos, app.egui.egui_ctx.content_rect()) else {
         return false;
     };
-    titlebar::resize(app.hwnd.get(), edge);
+    let hwnd = app.hwnd.get();
+    run_modal_gesture(app, || {
+        // SAFETY: `hwnd` came from winit and the window is still alive.
+        unsafe { titlebar::resize(hwnd, edge) };
+    });
+    true
+}
+
+/// If the press landed on the title-bar drag strip, start a native drag and
+/// report that the event was consumed.
+///
+/// Hit tested geometrically rather than through an egui widget on purpose. An
+/// egui drag widget queues a command on every frame it is dragged, and because
+/// the native drag pumps messages that re-enters the frame loop — each pass
+/// queueing another. Windows holds the mouse for the duration, so the release
+/// event never arrives and the nesting never unwinds.
+fn begin_title_bar_drag(app: &AppState) -> bool {
+    let Some(pos) = app.cursor.get() else {
+        return false;
+    };
+    let width = app.egui.egui_ctx.content_rect().width();
+    if !titlebar::is_in_drag_area(pos, width) {
+        return false;
+    }
+    let hwnd = app.hwnd.get();
+    run_modal_gesture(app, || {
+        // SAFETY: `hwnd` came from winit and the window is still alive.
+        unsafe { titlebar::drag_title_bar(hwnd) };
+    });
     true
 }
 

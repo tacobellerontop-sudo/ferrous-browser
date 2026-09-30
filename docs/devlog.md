@@ -896,3 +896,106 @@ no manual offset arithmetic needed.
 - Loading spinner never caught in a screenshot (P30/layout confirmed only).
 - Keyboard input reaching page content never confirmed with a text field.
 - `Opts::default().multiprocess` is still `false`; cross-process paint untested.
+---
+
+## 2026-09-30 — Entry 009: Fix title-bar drag wedging the UI (user-reported)
+
+### Symptom
+
+Reported after Entry 008 landed:
+
+> the custom title bar makes it really really laggy. i now cant click on the
+> buttons and the link address bar. i can use it to drag the window
+
+### How it was reproduced
+
+Not by eye — by measurement. CPU time over a fixed window, before and after one
+synthetic title-bar drag:
+
+| | CPU over the following seconds |
+| --- | --- |
+| at rest | 0 ms |
+| after **one** drag | **609 ms over 4 s** |
+
+One drag left the process permanently busy. That is the lag, measured.
+
+### Root cause
+
+`titlebar::draw` gave the drag strip `Sense::click_and_drag()` and, every frame
+it was dragged, pushed a `WindowCommand::DragTitleBar`. `draw_frame` applied
+those commands after `present()`:
+
+```
+draw_frame -> apply_window_command -> SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)
+```
+
+`SendMessageW` is **synchronous and pumps messages**. So the sequence was:
+
+1. `WM_NCLBUTTONDOWN` blocks, waiting for the gesture to end.
+2. While waiting it pumps messages, so `RedrawRequested` arrives.
+3. `draw_frame` runs again. Windows has the mouse captured, so the window never
+   receives the release — `dragged()` is still true, so it queues **another**
+   `DragTitleBar`.
+4. That nested frame applies another `SendMessageW`, which pumps again...
+
+Unbounded nesting. It never unwound because the mouse-up that would have ended
+the first drag was consumed by the inner loops. Every other click then landed in
+a process that was re-entering this loop, which is why the address bar and the
+buttons stopped responding. Dragging "working" was the one path that happened to
+complete.
+
+Worth noting the bug was invisible to the obvious test: four plain *clicks* on
+the title bar measured 0 ms, because `clicked()` settles within a frame. Only a
+real *drag* wedged it.
+
+### The fix
+
+Three changes, all removing a way for the modal loop to re-enter:
+
+1. **The strip is no longer an egui widget.** `Sense::hover()` instead of
+   `Sense::click_and_drag()`. It is painted only, so no drag state can ever
+   accumulate in egui. The buttons keep `Sense::click()` and are unaffected.
+2. **The drag is started from the mouse-down handler**, before egui and before
+   the page ever see the event, by geometric hit test
+   (`titlebar::is_in_drag_area`). Nothing is queued through a frame, so there is
+   nothing for the pumped messages to duplicate.
+3. **`run_modal_gesture` refuses re-entry.** `WM_NCLBUTTONDOWN` pumps messages, so
+   a second press can genuinely arrive while the first is on the stack; a
+   `Cell<bool>` makes a nested loop impossible rather than merely unlikely.
+
+`WindowCommand::DragTitleBar` is gone. Minimize, maximize and close do not block,
+so they stay deferred to the end of the frame.
+
+### Consequence for the layout
+
+`titlebar::is_in_drag_area` hit tests against `drag_rect`, which assumes the
+painted strip starts at the window origin. egui's default `Frame` has an 8pt
+inner margin, so the hit test and the pixels would have disagreed by 8pt and
+presses would land slightly off. The title-bar panel is therefore created with
+**zero inner and outer margin**, and `drag_rect` is the single source of truth
+for the geometry. Five unit tests cover it, including that a window narrower than
+the controls clamps the strip to zero width instead of going negative.
+
+### Verified after the fix
+
+| Check | Before | After |
+| --- | --- | --- |
+| CPU over 4 s after one drag | 609 ms | **0 ms** |
+| CPU over 4 s after four drags | — | **0 ms** |
+| CPU at rest, 5 s | — | **0 ms** |
+| Title-bar drag moves the window | did not | **exact**, e.g. 4 consecutive drags each moved it precisely (-25, +18) |
+| Address bar click + type + Enter | unresponsive | **works** — accepted the click, took the text, navigated |
+| Reload button | unresponsive | **works** |
+| Maximize / restore / minimize | — | **all work** after drags |
+| Close | — | **works** |
+
+32 unit tests pass; our crate is warning-free.
+
+The window drag is also *more* accurate than before the fix — in the buggy build
+the drag that wedged the app did not actually move the window.
+
+### Not re-verified
+
+Right-edge resize was already unverified in Entry 008 and is still is. The
+resize path shares `send_non_client` and the new `run_modal_gesture` guard with
+the drag, so it is no worse, but it is not confirmed.

@@ -25,10 +25,12 @@ use egui::{Rect, Sense, Ui};
 use crate::icons::{self, WindowIcon};
 
 /// What the user asked the *window* (not the page) to do.
+///
+/// Dragging is deliberately absent. `WM_NCLBUTTONDOWN` blocks in a modal
+/// Windows loop, so it is issued directly from the mouse-down handler — see
+/// [`drag_title_bar`] — rather than queued through a frame like these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowCommand {
-    /// Begin a native title-bar drag.
-    DragTitleBar,
     Minimize,
     ToggleMaximize,
     Close,
@@ -56,6 +58,31 @@ pub const TITLE_BAR_HEIGHT: f32 = 30.0;
 
 const BUTTON_WIDTH: f32 = 34.0;
 const CONTROL_WIDTH: f32 = BUTTON_WIDTH * 3.0;
+
+/// The drag strip, in egui points, for a window `width` points wide.
+///
+/// **This must agree with what [`draw`] allocates.** The title-bar panel is
+/// created with zero inner margin for exactly that reason: with egui's default
+/// 8pt margin the painted strip and the hit-test region would silently disagree,
+/// and the difference would only show up as clicks landing a few pixels off.
+///
+/// The strip is not an egui widget. It is painted only. Hit testing lives here,
+/// in [`is_in_drag_area`], so that a drag can never accumulate egui interaction
+/// state — see the note on `drag_title_bar`.
+pub fn drag_rect(width: f32) -> Rect {
+    Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2((width - CONTROL_WIDTH).max(0.0), TITLE_BAR_HEIGHT),
+    )
+}
+
+/// Whether a press at `point` should start a title-bar drag.
+///
+/// `drag_rect` is half-open, so the window controls sitting immediately to its
+/// right are excluded automatically and their presses fall through to egui.
+pub fn is_in_drag_area(point: egui::Pos2, width: f32) -> bool {
+    drag_rect(width).contains(point)
+}
 
 /// Which edge, if any, a point sits on. `None` means the interior.
 pub fn resize_edge_at(point: egui::Pos2, window: Rect) -> Option<ResizeEdge> {
@@ -102,29 +129,31 @@ pub fn draw(ui: &mut Ui, title: &str, maximized: bool) -> Vec<WindowCommand> {
     ui.horizontal(|ui| {
         // The drag strip occupies everything except the three control buttons.
         let drag_width = (ui.available_width() - CONTROL_WIDTH).max(0.0);
+        // `Sense::hover`, NOT `click_and_drag`. This is the important line in
+        // the file. Giving egui a draggable widget here meant `dragged()` stayed
+        // true for as long as the pointer was down, and it queued a native drag
+        // every frame; `WM_NCLBUTTONDOWN` pumps messages, so each one re-entered
+        // the frame loop and queued another. Windows holds the mouse during the
+        // drag, so the release event never reached us and the nesting never
+        // unwound — one title-bar drag was measured burning 609ms of CPU over
+        // the following 4 seconds, with the UI unresponsive. The strip is now
+        // painted only; the drag is started from the mouse-down handler by
+        // geometric hit test, so no egui interaction state can exist at all.
         // egui 0.34 returns (rect, response) in that order.
-        let (drag_rect, drag) = ui.allocate_exact_size(
+        let (strip, _strip_response) = ui.allocate_exact_size(
             egui::vec2(drag_width, TITLE_BAR_HEIGHT),
-            Sense::click_and_drag(),
+            Sense::hover(),
         );
 
         let painter = ui.painter().clone();
-        painter.rect_filled(
-            drag_rect,
-            0.0,
-            ui.visuals().widgets.noninteractive.bg_fill,
-        );
+        painter.rect_filled(strip, 0.0, ui.visuals().widgets.noninteractive.bg_fill);
         painter.text(
-            drag_rect.center(),
+            strip.center(),
             egui::Align2::CENTER_CENTER,
             title,
             egui::FontId::proportional(12.0),
             ui.visuals().text_color(),
         );
-
-        if drag.clicked() || drag.dragged() {
-            commands.push(WindowCommand::DragTitleBar);
-        }
 
         // Left-to-right, matching the Windows convention. `ui.horizontal` lays
         // out in order, so the array order is the visual order.
@@ -231,6 +260,11 @@ mod platform {
     /// Hand the interaction back to the window manager, which then runs its own
     /// modal loop for dragging or resizing.
     ///
+    /// **Blocks until the gesture ends**, pumping messages while it does. Call
+    /// it from the mouse-down handler and nowhere else — never from inside a
+    /// frame, because the pumped messages re-enter the frame loop and anything
+    /// the frame queued gets duplicated.
+    ///
     /// # Safety
     /// `hwnd` must be a live window handle for the duration of the call.
     unsafe fn send_non_client(hwnd: *mut c_void, hit_test: u32) {
@@ -240,12 +274,21 @@ mod platform {
         }
     }
 
-    pub fn drag_title_bar(hwnd: *mut c_void) {
-        // SAFETY: caller passes a live HWND obtained from winit.
+    /// Begin a native title-bar drag. See the module docs for why the drag is
+    /// routed through Windows at all.
+    ///
+    /// # Safety
+    /// `hwnd` must be a live window handle for the duration of the call.
+    pub unsafe fn drag_title_bar(hwnd: *mut c_void) {
+        // SAFETY: the caller guarantees a live HWND from winit.
         unsafe { send_non_client(hwnd, HTCAPTION) };
     }
 
-    pub fn resize(hwnd: *mut c_void, edge: ResizeEdge) {
+    /// Begin a native edge resize.
+    ///
+    /// # Safety
+    /// `hwnd` must be a live window handle for the duration of the call.
+    pub unsafe fn resize(hwnd: *mut c_void, edge: ResizeEdge) {
         let hit = match edge {
             ResizeEdge::Left => HTLEFT,
             ResizeEdge::Right => HTRIGHT,
@@ -256,7 +299,7 @@ mod platform {
             ResizeEdge::BottomLeft => HTBOTTOMLEFT,
             ResizeEdge::BottomRight => HTBOTTOMRIGHT,
         };
-        // SAFETY: caller passes a live HWND obtained from winit.
+        // SAFETY: the caller guarantees a live HWND from winit.
         unsafe { send_non_client(hwnd, hit) };
     }
 
@@ -274,10 +317,10 @@ mod platform {
 pub use platform::{drag_title_bar, resize, set_maximized};
 
 #[cfg(not(windows))]
-pub fn drag_title_bar(_hwnd: *mut std::ffi::c_void) {}
+pub unsafe fn drag_title_bar(_hwnd: *mut std::ffi::c_void) {}
 
 #[cfg(not(windows))]
-pub fn resize(_hwnd: *mut std::ffi::c_void, _edge: ResizeEdge) {}
+pub unsafe fn resize(_hwnd: *mut std::ffi::c_void, _edge: ResizeEdge) {}
 
 #[cfg(not(windows))]
 pub fn set_maximized(_hwnd: *mut std::ffi::c_void, _maximized: bool) {}
@@ -329,5 +372,42 @@ mod tests {
         assert_eq!(resize_edge_at(egui::pos2(-99.0, 300.0), w), None);
         assert_eq!(resize_edge_at(egui::pos2(300.0, -99.0), w), None);
         assert_eq!(resize_edge_at(egui::pos2(900.0, 700.0), w), None);
+    }
+
+    const W: f32 = 800.0;
+
+    #[test]
+    fn drag_area_spans_the_strip_but_not_the_controls() {
+        assert!(is_in_drag_area(egui::pos2(10.0, 5.0), W));
+        assert!(is_in_drag_area(egui::pos2(400.0, 15.0), W));
+
+        // The rightmost `CONTROL_WIDTH` belongs to the three buttons, which egui
+        // handles. If this ever returned true the buttons would be dead.
+        assert!(!is_in_drag_area(egui::pos2(W - CONTROL_WIDTH + 0.5, 15.0), W));
+        assert!(!is_in_drag_area(egui::pos2(W - 1.0, 15.0), W));
+    }
+
+    #[test]
+    fn drag_area_stops_at_the_bottom_of_the_strip() {
+        assert!(is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT - 0.5), W));
+        // The toolbar starts here, and must stay clickable.
+        assert!(!is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT + 1.0), W));
+    }
+
+    #[test]
+    fn drag_area_is_anchored_at_the_window_origin() {
+        // The title-bar panel is created with zero inner margin precisely so this
+        // holds. With egui's default 8pt margin the painted strip would start 8pt
+        // lower than the hit test expects.
+        assert_eq!(drag_rect(W).min, egui::pos2(0.0, 0.0));
+        assert_eq!(drag_rect(W).width(), W - CONTROL_WIDTH);
+        assert_eq!(drag_rect(W).height(), TITLE_BAR_HEIGHT);
+    }
+
+    #[test]
+    fn narrow_windows_do_not_produce_a_negative_drag_area() {
+        let rect = drag_rect(40.0);
+        assert_eq!(rect.width(), 0.0, "width must clamp, not go negative");
+        assert!(!is_in_drag_area(egui::pos2(10.0, 10.0), 40.0));
     }
 }
