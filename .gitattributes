@@ -1,0 +1,3 @@
+# Patches for the pinned Servo checkout must stay byte-exact: Servo's files use
+# LF, and a CRLF copy made by core.autocrlf would not apply.
+/patches/** -text
