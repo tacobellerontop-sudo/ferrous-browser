@@ -1262,3 +1262,84 @@ lines with the input extraction.
 - Right-edge window resize is still unconfirmed (Entry 008/009).
 - No tab reordering by dragging, and no tab overflow scrolling when there are more
   tabs than fit. Both are deliberate omissions, not bugs.
+
+---
+
+## 2026-10-01 — Entry 012: YouTube's blank pages were `document.all`, not missing features
+
+Entry 010 concluded that YouTube's blank pages were Servo's missing `:has()`,
+dedicated `Worker` and `MediaSource`, and that nothing on the embedder side
+could fix them. The first two parts were wrong. Search results and watch pages
+now render; only video playback (`MediaSource`) remains out of reach.
+
+### How it was found
+
+Search became testable once Enter and Space reached pages (the key-translation
+fix in the UI overhaul). The results page rendered its chips but no results. A
+probe run through `WebView::evaluate_javascript`, temporarily, showed:
+
+- 15-19 `ytd-video-renderer` elements **in the DOM**, with correct titles, and no
+  console errors: YouTube's scripts worked.
+- every one with a 0x0 box. Walking the ancestors found
+  `ytd-two-column-search-results-renderer` with `hidden` set, so `display: none`.
+- the template binds it as `hidden="[[data.hideContents]]"`, normally undefined.
+  Bindings were processed (only one raw `[[...]]` attribute on the whole page).
+- a user script wrapping the `hidden` setter caught Polymer assigning an object
+  whose string is `"zClosurez"`: polymer-resin's "innocuous" Trusted Types
+  placeholder, i.e. resin had rejected the binding.
+
+### The cause
+
+polymer-resin (Google's Polymer sanitizer, installed as
+`Polymer.sanitizeDOMValue`) lets falsy values through with:
+
+```js
+if (!v && v !== document.all) return v;
+```
+
+Servo has no `document.all` (commented out in `Document.webidl`, servo/servo#7396),
+so it evaluates to `undefined`, `undefined !== undefined` is false, and resin
+replaces `undefined` with its truthy placeholder. Every element bound that way
+is hidden.
+
+### The fix
+
+`browser/src/compat.rs`: site interventions, the mechanism Firefox ships as
+webcompat interventions. One user script, attached to every tab and guarded on
+`location.hostname`, defines `document.all` as `NaN` on youtube.com only. NaN is
+falsy and unequal to everything, so all three of resin's `document.all` checks
+behave exactly as in Chrome; YouTube uses `document.all` nowhere else. It should
+be deleted when Servo implements `document.all`.
+
+### Corrections to entry 010
+
+- **Dedicated `Worker` is present.** `Worker.webidl` has no `Pref`; the probe was
+  wrong.
+- **`:has()` is pref-gated, not unimplemented**, by the Stylo static pref
+  `layout.css.has-selector.enabled` (false), which Servo's `prefs::set` never
+  maps. Enabling it did not change YouTube, so it stays off.
+- **`requestIdleCallback`** is genuinely absent; a polyfill did not change
+  YouTube either.
+- The **home feed's** "Try searching to get started" is YouTube's own signed-out
+  empty state: the server response carries no video ids for it.
+
+### Side finding: site data was written to the working directory
+
+With no `Opts::config_dir`, Servo writes IndexedDB "bottles" relative to the
+working directory; the YouTube runs left 11 MB of them in `browser/`. Site data
+now lives in `%APPDATA%\Ferrous\profile`, which also makes cookies and storage
+persist between runs.
+
+### Verified on screen
+
+Search results with thumbnails, titles, channels, durations and the Shorts
+shelf; sidebar and search-button icons (also previously hidden); a watch page
+with player controls, title, channel, description, comment count and related
+videos, showing "Your browser can't play this video".
+
+### Not working
+
+- Video playback: no `MediaSource` in Servo.
+- Clicking a result title did not navigate; loading the watch URL directly does.
+  YouTube handles those clicks itself (client-side navigation); not yet
+  investigated.

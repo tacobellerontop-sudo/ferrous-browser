@@ -50,6 +50,7 @@ mod backdrop;
 mod blocker;
 mod browser_state;
 mod chrome;
+mod compat;
 mod engine;
 mod frame_stats;
 mod gpu_fx;

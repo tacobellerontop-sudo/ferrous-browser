@@ -19,11 +19,14 @@
 //!
 //! Measured on this checkout (see `docs/devlog.md` entry 010) against a probe
 //! page: with these off, `IntersectionObserver`, `@container`, `adoptedStyleSheets`
-//! and `container-type` were all **absent**; `:has()`, dedicated `Worker` and
-//! `MediaSource` were absent **with or without** these prefs, because they are
-//! not pref-gated — they are simply unimplemented in Servo. No combination of
-//! preferences will make YouTube's feed work; see the "Cannot be fixed here"
-//! note below.
+//! and `container-type` were all **absent**. `MediaSource` is unimplemented in
+//! Servo, so YouTube video cannot play whatever is set here.
+//!
+//! Entry 010 also blamed YouTube's blank pages on these missing features. That
+//! was wrong: the cause was the missing `document.all`, worked around in
+//! `compat.rs` (devlog entry 012). `Worker` is in fact present, and `:has()` is
+//! gated by a Stylo static pref (`layout.css.has-selector.enabled`) that
+//! enabling made no difference to YouTube.
 //!
 //! # What is deliberately NOT enabled
 //!

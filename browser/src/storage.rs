@@ -13,6 +13,16 @@ pub fn path(name: &str) -> Option<PathBuf> {
     Some(PathBuf::from(base).join("Ferrous").join(name))
 }
 
+/// `%APPDATA%\Ferrous\profile`: where Servo keeps site data (cookies,
+/// IndexedDB, local storage), created if missing. Without it Servo writes site
+/// storage relative to the working directory, wherever the browser was
+/// launched from.
+pub fn profile_dir() -> Option<PathBuf> {
+    let dir = path("profile")?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// Read a file, treating "missing" and "unreadable" alike: callers fall back to
 /// an empty default, which is right for a first run.
 pub fn read(name: &str) -> Option<String> {

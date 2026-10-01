@@ -37,6 +37,7 @@ use servo::{
     Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use servo::protocol_handler::ProtocolRegistry;
+use servo::{Opts, UserContentManager, UserScript};
 use url::Url;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -211,6 +212,7 @@ struct PageIme {
 
 pub struct WebEngine {
     engine: RefCell<Engine>,
+    interventions: Rc<UserContentManager>,
     /// Shared with every tab's delegate, which sets and clears it.
     page_ime: Rc<Cell<Option<PageIme>>>,
     rendering_context: Rc<dyn RenderingContext>,
@@ -242,12 +244,34 @@ impl WebEngine {
             .register(homepage::SCHEME, homepage::Protocol)
             .expect("ferrous: is not a scheme Servo reserves");
 
+        // Site data lives in the profile folder. Without a config directory
+        // Servo writes it relative to the working directory: running the
+        // browser from the repository left 11 MB of YouTube IndexedDB there.
+        let profile = crate::storage::profile_dir();
+        if profile.is_none() {
+            log::warn!("no profile directory; site data will not persist");
+        }
+        let opts = Opts {
+            temporary_storage: profile.is_none(),
+            config_dir: profile,
+            ..Opts::default()
+        };
+
         let servo = ServoBuilder::default()
+            .opts(opts)
             .preferences(crate::prefs::web_compat())
             .protocol_registry(protocols)
             .event_loop_waker(waker)
             .build();
         servo.setup_logging();
+
+        // Site interventions (see `compat`), shared by every tab. Each script
+        // checks its own host, so they cost nothing on other sites.
+        let interventions = Rc::new(UserContentManager::new(&servo));
+        for intervention in crate::compat::INTERVENTIONS {
+            info!("compat: intervention for {:?}: {}", intervention.hosts, intervention.reason);
+            interventions.add_script(Rc::new(UserScript::new(crate::compat::script(intervention), None)));
+        }
 
         WebEngine {
             scale_factor: Scale::new(window.scale_factor() as f32),
@@ -257,6 +281,7 @@ impl WebEngine {
                 active: RefCell::new(None),
             }),
             page_ime: Rc::new(Cell::new(None)),
+            interventions,
             rendering_context,
             state,
             window,
@@ -272,6 +297,7 @@ impl WebEngine {
         let webview = {
             let engine = self.engine.borrow();
             WebViewBuilder::new(&engine.servo, self.rendering_context.clone())
+                .user_content_manager(self.interventions.clone())
                 .url(url)
                 .hidpi_scale_factor(self.scale_factor)
                 .delegate(Rc::new(TabDelegate {
