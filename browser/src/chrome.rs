@@ -31,6 +31,7 @@
 //! points away from where the geometry said, and the title-bar drag hit test
 //! depends on knowing exactly where the tabs are.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,9 +45,11 @@ use egui::{
 };
 
 use crate::browser_state::BrowserState;
+use crate::homepage;
 use crate::gpu_fx::{self, Corners, EdgeGlow, Glass, GlowParams, PixelRect};
 use crate::icons;
-use crate::tab::{TabId, Tabs};
+use crate::tab::{Favicon, Tab, TabId, Tabs};
+use crate::zoom;
 use crate::theme;
 use crate::titlebar::{self, CONTROL_WIDTH, TITLE_BAR_HEIGHT, WindowCommand};
 
@@ -75,6 +78,14 @@ const SPRING_STIFFNESS: f32 = 420.0;
 const SPRING_DAMPING_RATIO: f32 = 0.72;
 /// How quickly the loading glow fades in and out, in seconds.
 const GLOW_FADE_TIME: f32 = 0.35;
+/// Side of a tab's site icon, and the gap after it.
+const FAVICON: f32 = 16.0;
+const FAVICON_GAP: f32 = 7.0;
+/// How long the zoom bubble stays after the zoom changes, and its fade-out.
+const ZOOM_BUBBLE_SECS: f64 = 1.2;
+const ZOOM_BUBBLE_FADE: f64 = 0.3;
+/// Room at the right of the address pill for the zoom badge, when shown.
+const ZOOM_BADGE_WIDTH: f32 = 50.0;
 
 /// Toolbar row, below the title row.
 const TOOLBAR_HEIGHT: f32 = 44.0;
@@ -113,6 +124,8 @@ pub enum Action {
     /// to the wrong tab if the strip changes between the click and the drain.
     CloseTab(TabId),
     SelectTab(TabId),
+    /// Back to 100%, from the zoom badge in the address bar.
+    ResetZoom,
 }
 
 /// What the chrome produced this frame.
@@ -162,6 +175,12 @@ pub struct Chrome {
     /// GPU effects; see `gpu_fx`.
     glass: Glass,
     glow: EdgeGlow,
+    /// One uploaded texture per tab icon, with the icon version it holds, so
+    /// an icon is uploaded once rather than every frame.
+    favicons: HashMap<TabId, (u64, egui::TextureHandle)>,
+    /// A zoom level to announce, and when it started showing (egui time; set
+    /// on the first frame that draws it).
+    zoom_bubble: Option<(f32, Option<f64>)>,
 }
 
 impl Chrome {
@@ -177,11 +196,20 @@ impl Chrome {
             last_time: None,
             glass: Glass::default(),
             glow: EdgeGlow::default(),
+            favicons: HashMap::new(),
+            zoom_bubble: None,
         }
     }
 
     pub fn request_focus_address_bar(&mut self) {
         self.focus_address_bar_next_frame = true;
+    }
+
+    /// Announce a new zoom level. The chrome is usually hidden, so a zoom
+    /// change made from the keyboard would otherwise have no visible effect
+    /// beyond the page reflowing.
+    pub fn show_zoom(&mut self, zoom: f32) {
+        self.zoom_bubble = Some((zoom, None));
     }
 
     /// Draw the chrome and report where the page goes.
@@ -244,6 +272,11 @@ impl Chrome {
                 .rect_stroke(card, radius, Stroke::new(1.0_f32, theme::OUTLINE), StrokeKind::Outside);
         }
         self.loading_glow(&ctx, tabs, card, radius);
+        self.zoom_bubble(&ctx, card, opacity);
+        // Forget textures for tabs that closed or lost their icon.
+        self.favicons.retain(|id, _| {
+            tabs.iter().any(|tab| tab.id == *id && tab.favicon.is_some())
+        });
 
         let mut output = Output {
             content_rect: card,
@@ -346,6 +379,70 @@ impl Chrome {
         output
     }
 
+    /// A small pill over the top of the page announcing the zoom level, shown
+    /// for a moment after it changes. Skipped while the panel is mostly
+    /// visible, since the address bar shows the level there.
+    fn zoom_bubble(&mut self, ctx: &egui::Context, card: Rect, panel_opacity: f32) {
+        let now = ctx.input(|i| i.time);
+        let Some((zoom, since)) = &mut self.zoom_bubble else {
+            return;
+        };
+        let zoom = *zoom;
+        let age = now - *since.get_or_insert(now);
+        if age >= ZOOM_BUBBLE_SECS {
+            self.zoom_bubble = None;
+            return;
+        }
+        let fade = ((ZOOM_BUBBLE_SECS - age) / ZOOM_BUBBLE_FADE).min(1.0) as f32;
+        let alpha = fade * (1.0 - panel_opacity);
+        ctx.request_repaint();
+        if alpha <= 0.0 {
+            return;
+        }
+        let text = format!("{}%", zoom::percent(zoom));
+        let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("ferrous.zoom")));
+        let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), theme::TEXT);
+        let size = galley.size() + vec2(28.0, 14.0);
+        let pill = Rect::from_center_size(pos2(card.center().x, card.top() + 28.0 + size.y / 2.0), size);
+        painter.add(
+            Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha((70.0 * alpha) as u8) }
+                .as_shape(pill, size.y / 2.0),
+        );
+        painter.add(RectShape::new(
+            pill,
+            size.y / 2.0,
+            Color32::from_rgb(0x1f, 0x20, 0x25).gamma_multiply(alpha),
+            Stroke::new(1.0_f32, theme::OUTLINE.gamma_multiply(alpha)),
+            StrokeKind::Inside,
+        ));
+        let pos = pill.center() - galley.size() / 2.0;
+        painter.galley_with_override_text_color(pos, galley, theme::TEXT.gamma_multiply(alpha));
+    }
+
+    /// The texture for `tab`'s icon, uploading it the first time a given icon
+    /// version is seen.
+    fn favicon_texture(&mut self, ctx: &egui::Context, tab: &Tab, icon: &Favicon) -> egui::TextureId {
+        if let Some((version, texture)) = self.favicons.get(&tab.id)
+            && *version == icon.version
+        {
+            return texture.id();
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        );
+        // Mipmapped: sites often serve 128-256px icons, which alias badly when
+        // drawn at 16px without them.
+        let options = egui::TextureOptions {
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+            ..egui::TextureOptions::LINEAR
+        };
+        let texture = ctx.load_texture(format!("ferrous.favicon.{}", tab.id.get()), image, options);
+        let id = texture.id();
+        self.favicons.insert(tab.id, (icon.version, texture));
+        id
+    }
+
     /// While the active page loads, a soft light sweeps around the edge of the
     /// card, drawn by a shader (`gpu_fx::EdgeGlow`). It fades in and out rather
     /// than switching, so a fast load is a brief shimmer, not a flash.
@@ -441,12 +538,28 @@ impl Chrome {
 
             let center_y = pill.center().y;
             let mut text_left = pill.left() + 10.0;
-            if tab.loading {
-                icons::spinner(&painter, pos2(text_left + 6.0, center_y), ui.input(|i| i.time), theme::ACCENT);
+            // The icon slot: a spinner while loading, otherwise the site's
+            // icon, or the Ferrous mark on the built-in homepage.
+            let icon_rect = Rect::from_center_size(pos2(text_left + FAVICON / 2.0, center_y), vec2(FAVICON, FAVICON));
+            let has_icon = if tab.loading {
+                icons::spinner(&painter, icon_rect.center(), ui.input(|i| i.time), theme::ACCENT);
                 // ~30 fps is smooth for a 12pt spinner and half the cost of
                 // repainting at the display rate.
                 ui.ctx().request_repaint_after(Duration::from_millis(33));
-                text_left += 20.0;
+                true
+            } else if homepage::is_homepage(&tab.url) {
+                painter.rect_filled(icon_rect.shrink(2.0), 4.0, theme::BRAND);
+                true
+            } else if let Some(icon) = &tab.favicon {
+                let texture = self.favicon_texture(ui.ctx(), tab, icon);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                painter.image(texture, icon_rect, uv, Color32::WHITE);
+                true
+            } else {
+                false
+            };
+            if has_icon {
+                text_left += FAVICON + FAVICON_GAP;
             }
 
             // The close button is always on the active tab, on the hovered tab,
@@ -550,6 +663,9 @@ impl Chrome {
         // for the whole widget and cannot overlap a second borrow of `tabs`.
         let committed = tabs.active().url.clone();
 
+        let page_zoom = tabs.active().zoom;
+        let zoomed = zoom::percent(page_zoom) != 100;
+
         let text = &mut tabs.active_mut().address_text;
 
         let (pill, pill_response) =
@@ -566,7 +682,10 @@ impl Chrome {
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
-        let field = Rect::from_min_max(pill.min + vec2(ADDRESS_ICON_SLOT, 0.0), pill.max - vec2(12.0, 0.0));
+        // A zoom badge at the right end while the page is not at 100%; it
+        // resets the zoom when clicked.
+        let right_inset = if zoomed { ZOOM_BADGE_WIDTH + 6.0 } else { 12.0 };
+        let field = Rect::from_min_max(pill.min + vec2(ADDRESS_ICON_SLOT, 0.0), pill.max - vec2(right_inset, 0.0));
         let response = ui.put(
             field,
             TextEdit::singleline(text)
@@ -599,6 +718,33 @@ impl Chrome {
             background,
             RectShape::new(pill, radius, fill, stroke, StrokeKind::Inside),
         );
+
+        if zoomed {
+            let badge = Rect::from_min_size(
+                pos2(pill.right() - ZOOM_BADGE_WIDTH - 4.0, pill.top() + 4.0),
+                vec2(ZOOM_BADGE_WIDTH, pill.height() - 8.0),
+            );
+            let response = ui.interact(badge, Id::new("ferrous.zoom_badge"), Sense::click());
+            let fill = if response.hovered() { theme::HOVER } else { theme::FIELD };
+            ui.painter().add(RectShape::new(
+                badge,
+                badge.height() / 2.0,
+                fill,
+                Stroke::new(1.0_f32, theme::OUTLINE),
+                StrokeKind::Inside,
+            ));
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}%", zoom::percent(page_zoom)),
+                FontId::proportional(11.5),
+                theme::TEXT_WEAK,
+            );
+            if response.clicked() {
+                actions.push(Action::ResetZoom);
+            }
+            response.on_hover_text("Reset zoom (Ctrl+0)");
+        }
 
         let icon_center = pos2(pill.left() + 18.0, pill.center().y);
         if focused || text.is_empty() {

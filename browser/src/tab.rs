@@ -18,6 +18,20 @@
 //! wrong tab. A reused id makes that possible; a never-reused one makes it
 //! impossible.
 
+use std::sync::Arc;
+
+/// A page's icon as straight (not premultiplied) RGBA pixels, already
+/// converted from whatever format the engine produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Favicon {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+    /// Different for every icon the engine reports, so the UI can tell when to
+    /// replace a texture without comparing pixels.
+    pub version: u64,
+}
+
 /// Stable, never-reused identifier for a tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabId(u64);
@@ -34,7 +48,8 @@ impl TabId {
 /// `address_text` lives here rather than in the browser-wide state because the
 /// address bar is per tab: switching to a background tab must show the address
 /// *it* is on, not whatever the previously active tab had half-typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq` only: `zoom` is a float.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
     pub id: TabId,
     /// Displayed address, which differs from `url` while the user is editing.
@@ -45,6 +60,9 @@ pub struct Tab {
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub loading: bool,
+    pub favicon: Option<Favicon>,
+    /// Page zoom, 1.0 = 100%.
+    pub zoom: f32,
 }
 
 impl Tab {
@@ -110,6 +128,8 @@ impl Tabs {
             can_go_back: false,
             can_go_forward: false,
             loading: false,
+            favicon: None,
+            zoom: 1.0,
         });
         self.active = self.tabs.len() - 1;
         id

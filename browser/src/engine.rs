@@ -32,7 +32,8 @@ use std::rc::Rc;
 use euclid::Scale;
 use log::info;
 use servo::{
-    DeviceIndependentPixel, DevicePixel, EventLoopWaker, InputEvent, LoadStatus, RenderingContext,
+    DeviceIndependentPixel, DevicePixel, EventLoopWaker, Image, InputEvent, LoadStatus, PixelFormat,
+    RenderingContext,
     Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use servo::protocol_handler::ProtocolRegistry;
@@ -42,7 +43,7 @@ use winit::window::Window;
 
 use crate::browser_state::{BrowserState, TabEvent};
 use crate::homepage;
-use crate::tab::TabId;
+use crate::tab::{Favicon, TabId};
 
 /// Owns the Servo instance and one `WebView` per tab.
 pub struct Engine {
@@ -313,6 +314,13 @@ impl WebEngine {
         self.engine.borrow().paint();
     }
 
+    /// Set the active tab's page zoom; 1.0 is 100%.
+    pub fn set_page_zoom(&self, zoom: f32) {
+        if let Some(webview) = self.engine.borrow().active_webview() {
+            webview.set_page_zoom(zoom);
+        }
+    }
+
     pub fn resize(&self, width: u32, height: u32) {
         self.engine.borrow().resize(width, height);
     }
@@ -366,6 +374,12 @@ impl WebViewDelegate for TabDelegate {
         self.redraw.request();
     }
 
+    fn notify_favicon_changed(&self, webview: WebView) {
+        let favicon = webview.favicon().and_then(|image| favicon_from(&image));
+        self.state.push_event(TabEvent::FaviconChanged { tab: self.tab, favicon });
+        self.redraw.request();
+    }
+
     fn notify_url_changed(&self, _webview: WebView, url: Url) {
         self.state.push_event(TabEvent::UrlChanged {
             tab: self.tab,
@@ -399,5 +413,78 @@ impl WebViewDelegate for TabDelegate {
             loading: status != LoadStatus::Complete,
         });
         self.redraw.request();
+    }
+}
+
+/// Convert Servo's favicon to the engine-neutral model.
+///
+/// Only the first frame of an animated icon is used, which is what browsers
+/// show in a tab anyway. Each conversion gets a fresh version number so the UI
+/// knows to replace its texture.
+fn favicon_from(image: &Image) -> Option<Favicon> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+    let rgba = to_rgba(image.format, image.width, image.height, image.data())?;
+    Some(Favicon {
+        width: image.width,
+        height: image.height,
+        rgba: rgba.into(),
+        version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
+    })
+}
+
+/// Expand any of Servo's pixel formats to straight RGBA8. Returns `None` if
+/// `data` is too short for the stated size, rather than reading past it.
+fn to_rgba(format: PixelFormat, width: u32, height: u32, data: &[u8]) -> Option<Vec<u8>> {
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    if pixels == 0 {
+        return None;
+    }
+    let channels = match format {
+        PixelFormat::K8 => 1,
+        PixelFormat::KA8 => 2,
+        PixelFormat::RGB8 => 3,
+        PixelFormat::RGBA8 | PixelFormat::BGRA8 => 4,
+    };
+    let data = data.get(..pixels.checked_mul(channels)?)?;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for px in data.chunks_exact(channels) {
+        let [r, g, b, a] = match format {
+            PixelFormat::K8 => [px[0], px[0], px[0], 255],
+            PixelFormat::KA8 => [px[0], px[0], px[0], px[1]],
+            PixelFormat::RGB8 => [px[0], px[1], px[2], 255],
+            PixelFormat::RGBA8 => [px[0], px[1], px[2], px[3]],
+            PixelFormat::BGRA8 => [px[2], px[1], px[0], px[3]],
+        };
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    Some(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_pixel_format_becomes_rgba() {
+        assert_eq!(to_rgba(PixelFormat::K8, 1, 1, &[7]), Some(vec![7, 7, 7, 255]));
+        assert_eq!(to_rgba(PixelFormat::KA8, 1, 1, &[7, 9]), Some(vec![7, 7, 7, 9]));
+        assert_eq!(to_rgba(PixelFormat::RGB8, 1, 1, &[1, 2, 3]), Some(vec![1, 2, 3, 255]));
+        assert_eq!(to_rgba(PixelFormat::RGBA8, 1, 1, &[1, 2, 3, 4]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(to_rgba(PixelFormat::BGRA8, 1, 1, &[3, 2, 1, 4]), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn short_or_empty_data_is_rejected_not_overread() {
+        assert_eq!(to_rgba(PixelFormat::RGBA8, 2, 2, &[0; 15]), None);
+        assert_eq!(to_rgba(PixelFormat::RGBA8, 0, 0, &[]), None);
+    }
+
+    #[test]
+    fn trailing_frames_are_ignored() {
+        // An animated icon carries more frames after the first.
+        let two_frames = [1, 2, 3, 4, 9, 9, 9, 9];
+        assert_eq!(to_rgba(PixelFormat::RGBA8, 1, 1, &two_frames), Some(vec![1, 2, 3, 4]));
     }
 }

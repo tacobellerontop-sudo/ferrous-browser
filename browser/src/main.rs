@@ -62,6 +62,7 @@ mod tab;
 mod theme;
 mod titlebar;
 mod window_state;
+mod zoom;
 
 use browser_state::BrowserState;
 use chrome::{Action, Chrome};
@@ -912,6 +913,13 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
     true
 }
 
+/// Set the active tab's page zoom and announce it.
+fn set_zoom(engine: &WebEngine, chrome: &mut Chrome, state: &BrowserState, level: f32) {
+    state.tabs_mut().active_mut().zoom = level;
+    engine.set_page_zoom(level);
+    chrome.show_zoom(level);
+}
+
 /// Carry out a chrome action. Returns true when the caller should shut the
 /// window down, which happens only when the last tab is closed.
 fn apply_action(
@@ -950,6 +958,7 @@ fn apply_action(
             }
         }
         Action::CloseTab(id) => return close_tab(engine, state, id),
+        Action::ResetZoom => set_zoom(engine, chrome, state, 1.0),
     }
     false
 }
@@ -1068,6 +1077,23 @@ fn handle_shortcut(
             }
             return true;
         }
+        // Zoom. '=' as well as '+', because on most layouts '+' needs Shift.
+        let zoom_change = if is_char('=') || is_char('+') {
+            Some(zoom::zoom_in(app.state.active_tab().zoom))
+        } else if is_char('-') {
+            Some(zoom::zoom_out(app.state.active_tab().zoom))
+        } else if is_char('0') {
+            Some(1.0)
+        } else {
+            None
+        };
+        if let Some(level) = zoom_change {
+            if pressed {
+                set_zoom(&app.engine, &mut app.chrome, &app.state, level);
+                app.window.request_redraw();
+            }
+            return true;
+        }
         if matches!(event.logical_key, WinitKey::Named(WinitNamedKey::Tab)) {
             if pressed {
                 // Ctrl+Shift+Tab goes backwards, matching every other browser.
@@ -1130,6 +1156,17 @@ fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
                     mouse_button(*button),
                     last_page_point(app),
                 )));
+        }
+        // Ctrl+wheel zooms instead of scrolling, one ladder step per notch.
+        WindowEvent::MouseWheel { delta, .. } if app.modifiers.get().control_key() => {
+            let up = match *delta {
+                MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+            };
+            let current = app.state.active_tab().zoom;
+            let level = if up { zoom::zoom_in(current) } else { zoom::zoom_out(current) };
+            set_zoom(&app.engine, &mut app.chrome, &app.state, level);
+            app.window.request_redraw();
         }
         WindowEvent::MouseWheel { delta, .. } => {
             // winit gives f32 line deltas; Servo's WheelDelta is f64.

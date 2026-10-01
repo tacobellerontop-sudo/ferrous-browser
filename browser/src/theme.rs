@@ -49,6 +49,8 @@ pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x62, 0x67, 0x6f);
 
 /// Focus outline, text selection, loading indicators.
 pub const ACCENT: Color32 = Color32::from_rgb(0x7c, 0xac, 0xf8);
+/// The Ferrous mark's colour, matching the homepage.
+pub const BRAND: Color32 = Color32::from_rgb(0xd0, 0x68, 0x3f);
 /// The second colour of the loading glow, which drifts between the two.
 pub const ACCENT_ALT: Color32 = Color32::from_rgb(0xb4, 0x8c, 0xff);
 

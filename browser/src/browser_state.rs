@@ -21,7 +21,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 
-use crate::tab::{Tab, TabId, Tabs};
+use crate::tab::{Favicon, Tab, TabId, Tabs};
 
 /// A callback from the engine, waiting to be applied to the tab model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub enum TabEvent {
     TitleChanged { tab: TabId, title: String },
     HistoryChanged { tab: TabId, can_go_back: bool, can_go_forward: bool },
     LoadStatus { tab: TabId, loading: bool },
+    FaviconChanged { tab: TabId, favicon: Option<Favicon> },
 }
 
 /// State shared between the UI layer and the Servo delegates.
@@ -95,6 +96,11 @@ impl BrowserState {
             };
             match event {
                 TabEvent::UrlChanged { url, .. } => {
+                    // A different site's icon must not linger on the tab while
+                    // the new page has not reported one (or has none).
+                    if host_of(&tab.url) != host_of(&url) {
+                        tab.favicon = None;
+                    }
                     tab.url = url.clone();
                     // Never yank text out from under someone mid-keystroke.
                     if !self.address_focused.get() {
@@ -107,6 +113,7 @@ impl BrowserState {
                     tab.can_go_forward = can_go_forward;
                 }
                 TabEvent::LoadStatus { loading, .. } => tab.loading = loading,
+                TabEvent::FaviconChanged { favicon, .. } => tab.favicon = favicon,
             }
         }
     }
@@ -151,8 +158,15 @@ fn tab_of(event: &TabEvent) -> TabId {
         TabEvent::UrlChanged { tab, .. }
         | TabEvent::TitleChanged { tab, .. }
         | TabEvent::HistoryChanged { tab, .. }
-        | TabEvent::LoadStatus { tab, .. } => *tab,
+        | TabEvent::LoadStatus { tab, .. }
+        | TabEvent::FaviconChanged { tab, .. } => *tab,
     }
+}
+
+/// The host of `url`, if it has one. Used to decide whether a navigation left
+/// the site, in which case the old favicon is dropped.
+fn host_of(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(str::to_owned)
 }
 
 /// `about:blank` is Servo's default document, not somewhere the user navigated
@@ -305,5 +319,36 @@ mod tests {
 
         state.note_loading_started();
         assert!(state.tabs().active().loading);
+    }
+
+    fn icon(version: u64) -> Favicon {
+        Favicon { width: 1, height: 1, rgba: vec![0, 0, 0, 255].into(), version }
+    }
+
+    #[test]
+    fn a_favicon_lands_on_its_own_tab() {
+        let state = BrowserState::default();
+        let first = state.tabs_mut().create("https://a.test/");
+        let second = state.tabs_mut().create("https://b.test/");
+        state.push_event(TabEvent::FaviconChanged { tab: first, favicon: Some(icon(1)) });
+        state.drain_events();
+        let tabs = state.tabs();
+        let by_id = |id| tabs.iter().find(|t| t.id == id).unwrap().favicon.clone();
+        assert_eq!(by_id(first), Some(icon(1)));
+        assert_eq!(by_id(second), None, "the active tab is not the one that changed");
+    }
+
+    #[test]
+    fn leaving_the_site_drops_the_favicon_but_staying_keeps_it() {
+        let state = BrowserState::default();
+        let id = state.tabs_mut().create("https://a.test/");
+        state.push_event(TabEvent::FaviconChanged { tab: id, favicon: Some(icon(1)) });
+        state.push_event(TabEvent::UrlChanged { tab: id, url: "https://a.test/page".into() });
+        state.drain_events();
+        assert!(state.tabs().active().favicon.is_some(), "same host keeps its icon");
+
+        state.push_event(TabEvent::UrlChanged { tab: id, url: "https://b.test/".into() });
+        state.drain_events();
+        assert!(state.tabs().active().favicon.is_none(), "another site's icon is dropped");
     }
 }
