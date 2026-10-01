@@ -138,6 +138,15 @@ pub fn shield(painter: &Painter, center: Pos2, color: Color32, active: bool) {
     }
 }
 
+/// A clock face, for history suggestions.
+pub fn clock(painter: &Painter, center: Pos2, color: Color32) {
+    painter.circle_stroke(center, 6.0, Stroke::new(1.3_f32, color));
+    painter.add(Shape::line(
+        vec![center + vec2(0.0, -3.6), center, center + vec2(2.6, 1.6)],
+        Stroke::new(1.3_f32, color),
+    ));
+}
+
 /// A plus sign, for the New Tab control.
 pub fn plus(painter: &Painter, center: Pos2, color: Color32) {
     const ARM: f32 = 5.0;

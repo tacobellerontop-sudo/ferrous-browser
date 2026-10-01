@@ -45,6 +45,7 @@ use egui::{
 };
 
 use crate::browser_state::BrowserState;
+use crate::history::{self, Entry};
 use crate::homepage;
 use crate::gpu_fx::{self, Corners, EdgeGlow, Glass, GlowParams, PixelRect};
 use crate::icons;
@@ -86,6 +87,8 @@ const ZOOM_BUBBLE_SECS: f64 = 1.2;
 const ZOOM_BUBBLE_FADE: f64 = 0.3;
 /// Room at the right of the address pill for the zoom badge, when shown.
 const ZOOM_BADGE_WIDTH: f32 = 50.0;
+/// Height of one row in the address-bar suggestions.
+const SUGGESTION_ROW: f32 = 34.0;
 /// The blocker's shield: icon only, or icon plus a count.
 const SHIELD_WIDTH: f32 = 28.0;
 const SHIELD_WITH_COUNT_WIDTH: f32 = 50.0;
@@ -186,6 +189,20 @@ pub struct Chrome {
     /// A zoom level to announce, and when it started showing (egui time; set
     /// on the first frame that draws it).
     zoom_bubble: Option<(f32, Option<f64>)>,
+    /// Address-bar suggestions for `suggest_query`, recomputed only when the
+    /// typed text changes.
+    suggestions: Vec<Entry>,
+    suggest_query: String,
+    /// Keyboard selection: a suggestion index, or `suggestions.len()` for the
+    /// "search for ..." row.
+    selected: Option<usize>,
+    /// Where each suggestion row was drawn last frame and where it leads.
+    /// Clicks are matched against these: by the time a click on a row is
+    /// processed, the press has already taken focus from the address bar and
+    /// the dropdown would no longer be drawn.
+    suggestion_rows: Vec<(Rect, String)>,
+    /// The dropdown's outline last frame, for the pointer zone.
+    dropdown: Rect,
 }
 
 impl Chrome {
@@ -203,6 +220,11 @@ impl Chrome {
             glow: EdgeGlow::default(),
             favicons: HashMap::new(),
             zoom_bubble: None,
+            suggestions: Vec::new(),
+            suggest_query: String::new(),
+            selected: None,
+            suggestion_rows: Vec::new(),
+            dropdown: Rect::NOTHING,
         }
     }
 
@@ -305,6 +327,9 @@ impl Chrome {
         let shown = panel.translate(vec2(0.0, (-(1.0 - t) * (PANEL_HEIGHT + gap + 8.0)).round()));
         self.last_panel = shown;
         output.pointer_zone = reveal_zone.union(shown.expand(6.0));
+        if self.dropdown != Rect::NOTHING {
+            output.pointer_zone = output.pointer_zone.union(self.dropdown.expand(6.0));
+        }
 
         egui::Area::new(Id::new("ferrous.chrome"))
             .order(Order::Foreground)
@@ -422,6 +447,87 @@ impl Chrome {
         ));
         let pos = pill.center() - galley.size() / 2.0;
         painter.galley_with_override_text_color(pos, galley, theme::TEXT.gamma_multiply(alpha));
+    }
+
+    fn close_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.suggest_query.clear();
+        self.selected = None;
+        self.suggestion_rows.clear();
+        self.dropdown = Rect::NOTHING;
+    }
+
+    /// The dropdown under the address bar: matching history, then a row that
+    /// searches for exactly what was typed.
+    fn suggestion_list(&mut self, ui: &Ui, pill: Rect, query: &str) {
+        let count = self.suggestions.len() + 1;
+        let height = count as f32 * SUGGESTION_ROW + 8.0;
+        let outline = Rect::from_min_size(pos2(pill.left(), pill.bottom() + 6.0), vec2(pill.width(), height));
+        self.dropdown = outline;
+        let mut rows = Vec::with_capacity(count);
+
+        egui::Area::new(Id::new("ferrous.suggestions"))
+            .order(Order::Tooltip)
+            .fixed_pos(outline.min)
+            .constrain(false)
+            .show(ui.ctx(), |ui| {
+                let _ = ui.allocate_exact_size(outline.size(), Sense::hover());
+                let painter = ui.painter();
+                painter.add(
+                    Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(110) }
+                        .as_shape(outline, 10.0),
+                );
+                painter.add(RectShape::new(
+                    outline,
+                    10.0,
+                    Color32::from_rgb(0x1f, 0x20, 0x25),
+                    Stroke::new(1.0_f32, theme::OUTLINE),
+                    StrokeKind::Inside,
+                ));
+
+                let search = (format!("Search for \u{201c}{query}\u{201d}"), String::new(), query.to_owned());
+                let entries = self.suggestions.iter().map(|e| {
+                    let title = if e.title.is_empty() { e.url.clone() } else { e.title.clone() };
+                    (title, display_address(&e.url), e.url.clone())
+                });
+                for (i, (primary, secondary, target)) in entries.chain(std::iter::once(search)).enumerate() {
+                    let row = Rect::from_min_size(
+                        pos2(outline.left() + 4.0, outline.top() + 4.0 + i as f32 * SUGGESTION_ROW),
+                        vec2(outline.width() - 8.0, SUGGESTION_ROW),
+                    );
+                    let response = ui.interact(row, Id::new(("ferrous.suggestion", i)), Sense::click());
+                    let lit = response.hovered() || self.selected == Some(i);
+                    if lit {
+                        painter.rect_filled(row, 7.0, theme::HOVER);
+                    }
+                    let icon = pos2(row.left() + 16.0, row.center().y);
+                    if secondary.is_empty() {
+                        icons::search(painter, icon, theme::TEXT_WEAK);
+                    } else {
+                        icons::clock(painter, icon, theme::TEXT_WEAK);
+                    }
+                    let clip = Rect::from_min_max(pos2(row.left() + 34.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
+                    let text = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
+                    let title = text.layout_no_wrap(primary, FontId::proportional(13.0), theme::TEXT);
+                    // A long title gets at most 60% of the row, fading out
+                    // there, so the address beside it stays readable.
+                    let title_width = title.size().x.min(clip.width() * 0.6);
+                    let title_pos = pos2(clip.left(), row.center().y - title.size().y / 2.0);
+                    if title.size().x > title_width {
+                        let column = Rect::from_x_y_ranges(clip.left()..=clip.left() + title_width, clip.y_range());
+                        fade_text(&text.with_clip_rect(column.intersect(text.clip_rect())), title_pos, &title, theme::TEXT, column.right());
+                    } else {
+                        text.galley(title_pos, title, theme::TEXT);
+                    }
+                    if !secondary.is_empty() {
+                        let url = text.layout_no_wrap(secondary, FontId::proportional(12.0), theme::TEXT_FAINT);
+                        let x = clip.left() + title_width + 12.0;
+                        text.galley(pos2(x, row.center().y - url.size().y / 2.0), url, theme::TEXT_FAINT);
+                    }
+                    rows.push((row, target));
+                }
+            });
+        self.suggestion_rows = rows;
     }
 
     /// The blocker's shield: lit while blocking is on for `site`, with the
@@ -723,6 +829,32 @@ impl Chrome {
         let background = ui.painter().add(Shape::Noop);
 
         let was_focused = ui.memory(|m| m.has_focus(ADDRESS_BAR_ID()));
+
+        // Arrow keys move through the suggestions. Consumed before the text
+        // field sees them, where they would move the caret.
+        let rows = self.suggestion_rows.len();
+        if was_focused && rows > 0 {
+            let (down, up) = ui.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                )
+            });
+            if down {
+                self.selected = Some(self.selected.map_or(0, |s| (s + 1).min(rows - 1)));
+            }
+            if up {
+                self.selected = self.selected.and_then(|s| s.checked_sub(1));
+            }
+        }
+
+        // A press on a suggestion row from last frame picks it.
+        let picked = ui.input(|i| {
+            i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten()
+        })
+        .and_then(|origin| {
+            self.suggestion_rows.iter().find(|(rect, _)| rect.contains(origin)).map(|(_, target)| target.clone())
+        });
         let font = FontId::proportional(13.5);
         let mut layouter = |ui: &Ui, buffer: &dyn TextBuffer, _wrap_width: f32| -> Arc<Galley> {
             let job = address_layout(buffer.as_str(), font.clone(), !was_focused);
@@ -841,12 +973,35 @@ impl Chrome {
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
 
+        if let Some(target) = picked {
+            actions.push(Action::Navigate(target));
+            response.surrender_focus();
+            self.close_suggestions();
+            return;
+        }
+
+        // Suggestions follow the typed text while it differs from the page's
+        // own address.
+        let typing = focused && !text.trim().is_empty() && text.trim() != committed;
+        if typing {
+            if self.suggest_query != *text {
+                self.suggest_query = text.clone();
+                self.suggestions = self.state.history.borrow().suggest(text, history::now());
+                self.selected = None;
+            }
+            let query = text.trim().to_owned();
+            self.suggestion_list(ui, pill, &query);
+        } else if !enter {
+            self.close_suggestions();
+        }
+
         // Escape abandons the edit and restores the address of the page actually
         // loaded. Without this a half-typed URL sticks around and looks like the
         // browser's real location, which is worse than showing nothing.
         if focused && escape {
             *text = committed;
             response.surrender_focus();
+            self.close_suggestions();
             return;
         }
 
@@ -861,7 +1016,15 @@ impl Chrome {
         // builder.rs:35.
         if response.lost_focus() {
             let trimmed = text.trim().to_owned();
-            if enter && !trimmed.is_empty() {
+            // A suggestion chosen with the arrow keys wins over the raw text.
+            let chosen = self
+                .selected
+                .and_then(|i| self.suggestion_rows.get(i))
+                .map(|(_, target)| target.clone());
+            self.close_suggestions();
+            if enter && let Some(target) = chosen {
+                actions.push(Action::Navigate(target));
+            } else if enter && !trimmed.is_empty() {
                 actions.push(Action::Navigate(trimmed));
             } else {
                 // Lost focus without submitting: put the real address back so the
@@ -992,6 +1155,14 @@ fn fade_text(painter: &egui::Painter, pos: Pos2, galley: &Arc<Galley>, color: Co
             color.gamma_multiply(alpha),
         );
     }
+}
+
+/// A URL as it reads best in a suggestion: no scheme, no `www.`, no trailing
+/// slash on a bare host.
+fn display_address(url: &str) -> String {
+    let url = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
+    let url = url.strip_prefix("www.").unwrap_or(url);
+    url.strip_suffix('/').filter(|rest| !rest.contains('/')).unwrap_or(url).to_owned()
 }
 
 /// Lay out the address text, with the host emphasised when `emphasise_host` is
@@ -1133,5 +1304,12 @@ mod tests {
         let mut spring = Spring { target: 1.0, ..Spring::default() };
         spring.step(5.0);
         assert!(spring.position < 0.9, "one frame after a stall should not finish the slide");
+    }
+
+    #[test]
+    fn suggestion_addresses_drop_noise() {
+        assert_eq!(display_address("https://www.github.com/"), "github.com");
+        assert_eq!(display_address("https://docs.rs/egui/latest/"), "docs.rs/egui/latest/");
+        assert_eq!(display_address("http://localhost:8000/"), "localhost:8000");
     }
 }

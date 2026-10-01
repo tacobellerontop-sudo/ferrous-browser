@@ -314,6 +314,12 @@ impl WebEngine {
         self.engine.borrow().paint();
     }
 
+    /// Whether `tab` already has a web view. Tabs restored from the last session
+    /// do not, until they are first shown.
+    pub fn has_tab(&self, tab: TabId) -> bool {
+        self.engine.borrow().webviews.borrow().contains_key(&tab)
+    }
+
     /// Set the active tab's page zoom; 1.0 is 100%.
     pub fn set_page_zoom(&self, zoom: f32) {
         if let Some(webview) = self.engine.borrow().active_webview() {

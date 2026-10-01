@@ -22,6 +22,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 
 use crate::blocker::Blocker;
+use crate::history::{self, History};
 use crate::tab::{Favicon, Tab, TabId, Tabs};
 
 /// A callback from the engine, waiting to be applied to the tab model.
@@ -48,6 +49,8 @@ pub struct BrowserState {
     /// Decides which requests to cancel. Shared here so the engine can consult
     /// it and the chrome can show and toggle it.
     pub blocker: Blocker,
+    /// Every page visited; the source of address-bar suggestions.
+    pub history: RefCell<History>,
     /// Set when Servo reports a new frame, cleared when the frame loop paints
     /// it. Lets the loop skip WebRender entirely on chrome-only frames.
     needs_paint: Cell<bool>,
@@ -57,7 +60,11 @@ impl BrowserState {
     /// The state a running browser starts with: the saved blocker allowlist
     /// loaded, everything else empty.
     pub fn new() -> Self {
-        Self { blocker: Blocker::load(), ..Self::default() }
+        Self {
+            blocker: Blocker::load(),
+            history: RefCell::new(History::load()),
+            ..Self::default()
+        }
     }
 }
 
@@ -104,6 +111,8 @@ impl BrowserState {
             return;
         }
         let mut tabs = self.tabs.borrow_mut();
+        let mut history = self.history.borrow_mut();
+        let now = history::now();
         for event in events {
             let Some(tab) = tabs.get_mut(tab_of(&event)) else {
                 continue;
@@ -120,13 +129,17 @@ impl BrowserState {
                     if without_fragment(&tab.url) != without_fragment(&url) {
                         tab.blocked = 0;
                     }
+                    history.visit(&url, now);
                     tab.url = url.clone();
                     // Never yank text out from under someone mid-keystroke.
                     if !self.address_focused.get() {
                         tab.address_text = display_url(&url);
                     }
                 }
-                TabEvent::TitleChanged { title, .. } => tab.title = title,
+                TabEvent::TitleChanged { title, .. } => {
+                    history.set_title(&tab.url, &title);
+                    tab.title = title;
+                }
                 TabEvent::HistoryChanged { can_go_back, can_go_forward, .. } => {
                     tab.can_go_back = can_go_back;
                     tab.can_go_forward = can_go_forward;
@@ -393,5 +406,17 @@ mod tests {
         state.push_event(TabEvent::UrlChanged { tab: id, url: "https://a.test/next".into() });
         state.drain_events();
         assert_eq!(state.tabs().active().blocked, 0, "a new page starts counting again");
+    }
+
+    #[test]
+    fn visited_pages_and_their_titles_reach_history() {
+        let state = BrowserState::default();
+        let id = state.tabs_mut().create("ferrous:newtab");
+        state.push_event(TabEvent::UrlChanged { tab: id, url: "https://servo.org/".into() });
+        state.push_event(TabEvent::TitleChanged { tab: id, title: "Servo".into() });
+        state.drain_events();
+        let found = state.history.borrow().suggest("servo", history::now());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Servo");
     }
 }

@@ -58,7 +58,9 @@ mod icons;
 mod input;
 mod page_mask;
 mod prefs;
+mod history;
 mod scroll;
+mod session;
 mod storage;
 mod tab;
 mod theme;
@@ -173,6 +175,9 @@ struct AppState {
     last_move_sent: Cell<Instant>,
     /// Opt-in frame timing (`FERROUS_FRAME_STATS=1`). See `frame_stats`.
     frame_stats: frame_stats::FrameStats,
+    /// The session as last written, and when, for debounced saving.
+    saved_session: RefCell<Option<session::Session>>,
+    last_persist: Cell<Instant>,
     /// Set when the last tab is closed from a shortcut. `handle_shortcut` has no
     /// access to the `ActiveEventLoop` that owns exiting, so the request is
     /// carried up to `window_event`.
@@ -303,12 +308,38 @@ impl ApplicationHandler<WakerEvent> for App {
 
         // The first tab. Its id comes from the tab model, which is the single
         // source of truth for identity; the engine is told about it afterwards.
-        let first = state.tabs_mut().create(START_URL);
-        engine.open_tab(
-            first,
-            Url::parse(START_URL).expect("START_URL must be valid"),
-            true,
-        );
+        // Reopen last session's tabs, or start on the homepage. Only the active
+        // tab gets a web view now; the rest load when first selected.
+        match session::Session::load() {
+            Some(saved) => {
+                let mut active = None;
+                for (i, tab) in saved.tabs.iter().enumerate() {
+                    let id = state.tabs_mut().create(&tab.url);
+                    if let Some(model) = state.tabs_mut().get_mut(id) {
+                        model.title = tab.title.clone();
+                        model.zoom = tab.zoom;
+                        if homepage::is_homepage(&tab.url) {
+                            model.address_text.clear();
+                        }
+                    }
+                    if i == saved.active {
+                        active = Some(id);
+                    }
+                }
+                let active = active.expect("Session::from_text clamps the active index");
+                state.tabs_mut().select(active);
+                show_tab(&engine, &state, active);
+                info!("ferrous: restored {} tabs", saved.tabs.len());
+            }
+            None => {
+                let first = state.tabs_mut().create(START_URL);
+                engine.open_tab(
+                    first,
+                    Url::parse(START_URL).expect("START_URL must be valid"),
+                    true,
+                );
+            }
+        }
 
         info!("ferrous: started");
         *self = Self::Running(Box::new(AppState {
@@ -341,6 +372,8 @@ impl ApplicationHandler<WakerEvent> for App {
             pending_move: Cell::new(None),
             last_move_sent: Cell::new(Instant::now()),
             frame_stats: frame_stats::FrameStats::from_env(),
+            saved_session: RefCell::new(None),
+            last_persist: Cell::new(Instant::now()),
             close_requested: Cell::new(false),
         }));
         if let Self::Running(app) = self {
@@ -361,6 +394,7 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         };
         let now = Instant::now();
+        persist_browsing(app, false);
 
         // A held-back pointer move whose interval has passed goes out now;
         // otherwise wake up when it is due, so the page always ends up with
@@ -396,6 +430,7 @@ impl ApplicationHandler<WakerEvent> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Self::Running(app) = self {
             persist_placement(app);
+            persist_browsing(app, true);
             app.frame_stats.finish();
         }
     }
@@ -915,6 +950,45 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
     true
 }
 
+/// Bring tab `id` to the front, creating its web view first if it was restored
+/// from the last session and has not been shown yet.
+fn show_tab(engine: &WebEngine, state: &BrowserState, id: TabId) {
+    if !engine.has_tab(id) {
+        let saved = state.tabs().iter().find(|t| t.id == id).map(|t| (t.url.clone(), t.zoom));
+        if let Some((url, zoom)) = saved
+            && let Ok(url) = Url::parse(&url)
+        {
+            engine.open_tab(id, url, true);
+            if zoom != 1.0 {
+                engine.set_page_zoom(zoom);
+            }
+            return;
+        }
+    }
+    engine.activate(id);
+}
+
+/// Save the session and history: on exit always, otherwise at most every few
+/// seconds and only when something changed, so a crash loses little and an
+/// idle browser writes nothing.
+fn persist_browsing(app: &AppState, force: bool) {
+    const INTERVAL: Duration = Duration::from_secs(3);
+    if !force && app.last_persist.get().elapsed() < INTERVAL {
+        return;
+    }
+    app.last_persist.set(Instant::now());
+    // The tab set is empty only while the window is closing after its last tab.
+    if app.state.tabs().is_empty() {
+        return;
+    }
+    let current = session::Session::of(&app.state.tabs());
+    if app.saved_session.borrow().as_ref() != Some(&current) {
+        current.save();
+        *app.saved_session.borrow_mut() = Some(current);
+    }
+    app.state.history.borrow_mut().save_if_dirty();
+}
+
 /// Set the active tab's page zoom and announce it.
 fn set_zoom(engine: &WebEngine, chrome: &mut Chrome, state: &BrowserState, level: f32) {
     state.tabs_mut().active_mut().zoom = level;
@@ -956,7 +1030,7 @@ fn apply_action(
             // `select` returns false for a tab that closed between the click and
             // here, which is not an error.
             if state.tabs_mut().select(id) {
-                engine.activate(id);
+                show_tab(engine, state, id);
             }
         }
         Action::CloseTab(id) => return close_tab(engine, state, id),
@@ -1001,7 +1075,7 @@ fn close_tab(engine: &WebEngine, state: &BrowserState, id: TabId) -> bool {
     match state.tabs_mut().close(id) {
         CloseOutcome::ClosedLast => true,
         CloseOutcome::Closed(active) => {
-            engine.activate(active);
+            show_tab(engine, state, active);
             false
         }
     }
@@ -1112,8 +1186,9 @@ fn handle_shortcut(
             if pressed {
                 // Ctrl+Shift+Tab goes backwards, matching every other browser.
                 let delta = if mods.shift_key() { -1 } else { 1 };
-                if let Some(id) = app.state.tabs_mut().select_offset(delta) {
-                    app.engine.activate(id);
+                let selected = app.state.tabs_mut().select_offset(delta);
+                if let Some(id) = selected {
+                    show_tab(&app.engine, &app.state, id);
                 }
                 app.window.request_redraw();
             }
