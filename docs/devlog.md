@@ -1343,3 +1343,86 @@ videos, showing "Your browser can't play this video".
 - Clicking a result title did not navigate; loading the watch URL directly does.
   YouTube handles those clicks itself (client-side navigation); not yet
   investigated.
+
+---
+
+## 2026-10-01 — Entry 013: YouTube result clicks do navigate; no Servo gap found
+
+Entry 012 listed "clicking a result title did not navigate" as broken. On the
+build at `7c468c0` it does not reproduce, so no intervention was added and
+`compat.rs` is unchanged.
+
+### Method
+
+A temporary user script (same `UserContentManager` as `compat.rs`, loaded from
+a file named by an environment variable) logged `mousedown`/`mouseup`/`click`
+in the capture phase with `isTrusted` and the composed path, `defaultPrevented`
+after dispatch, `fetch` and XHR requests and their results,
+`History.prototype.pushState`/`replaceState`, `popstate`, YouTube's
+`yt-navigate*` events, and `error`/`unhandledrejection`. A temporary
+`show_console_message` delegate printed its lines to stderr. Clicks were real
+OS input (`SetCursorPos` + `mouse_event`), so they took the same path as a
+user's: winit → coalesced pointer move flushed → `forward_to_page` →
+`InputEvent::MouseButton`. All of it has been removed.
+
+### What happens on a click
+
+1. A trusted `click` reaches `a#video-title` at the expected point
+   (`yt-formatted-string < a#video-title[href=/watch?v=…] < … < ytd-video-renderer`).
+2. YouTube's handler runs: it dispatches `yt-navigate` and calls
+   `preventDefault()` (`defaultPrevented=true` after dispatch).
+3. `fetch` POST `/youtubei/v1/get_watch` returns 200; `yt-navigate-start`,
+   `yt-page-data-fetched`, `yt-navigate-finish` follow.
+4. `location.href` becomes `/watch?v=…` and `history.length` grows by one.
+   Ferrous's address bar and tab title follow (`notify_url_changed`).
+5. Ferrous's Back button fires `popstate`, and YouTube restores the results page.
+
+The endpoint is `get_watch`, not `next` as assumed in entry 012.
+
+### Cases tried, all of which navigate
+
+| Case | Result |
+| --- | --- |
+| Results page loaded directly, click title | watch page, URL updated |
+| Search typed into YouTube's own box (SPA results page), click title | same |
+| Clicks every second from 3 s after launch (page still loading) | first click that lands navigates |
+| Pointer hovered the thumbnail first | same (no hover preview appears) |
+| Scrolled with the wheel, then click | same |
+| Thumbnail click | same |
+| **Control: no diagnostic script at all**, title and thumbnail | same |
+
+The control matters: the probe wraps `fetch`, XHR and `dispatchEvent`, so it
+could have masked a failure. Without it, the result is the same.
+
+The earlier failure was not captured, so its cause is unknown. Possible causes
+include a click that missed the link, or a build from before the rest of the
+entry 012 fixes. If it comes back, re-run the probe above before guessing.
+
+### Worth knowing about YouTube's history code
+
+YouTube does not call `window.history.pushState`. It makes a hidden
+`<iframe sandbox="allow-same-origin" src="about:blank">` and takes `pushState`
+from the **iframe's** `History` prototype, bound to the top window's `history`,
+so that extensions wrapping `pushState` are bypassed. Wrapping
+`History.prototype.pushState` therefore logs nothing on YouTube; it is not
+evidence that `pushState` was never called. Servo handles this cross-realm call
+correctly: a self-test of exactly that pattern changed the top window's URL and
+history length.
+
+### Side finding: user scripts run once per `<head>`, not once per document
+
+Every user script ran **three times** on YouTube pages. Servo runs user scripts
+from `HTMLHeadElement::bind_to_tree` (`components/script/dom/userscripts.rs`,
+called from `htmlheadelement.rs`), so they run each time a `<head>` is inserted
+into the document. Browsers run them once per document. The `document.all`
+intervention is idempotent (it checks `'all' in Document.prototype` first), so
+this is harmless today. **Any future intervention must be idempotent too**, for
+example by guarding on a marker property, or it will wrap or patch things
+several times.
+
+### Also seen, not investigated
+
+- After Back, the tab title kept the watch page's title for a moment and showed
+  the loading spinner.
+- When scrolled, the masthead background is see-through.
+- After an SPA search, the search-button icon is blank.
