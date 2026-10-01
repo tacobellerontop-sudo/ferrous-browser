@@ -61,6 +61,11 @@ jobs:
           }
           Write-Host "Servo pinned at $actual"
 
+      # Our few fixes to Servo; see docs/servo-version.md, "Local patches".
+      - name: Apply Servo patches
+        shell: pwsh
+        run: .\scriptspply-servo-patches.ps1
+
       - name: Install uv (required by mach)
         shell: pwsh
         run: irm https://astral.sh/uv/install.ps1 | iex

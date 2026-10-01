@@ -3,10 +3,10 @@ target/
 
 # Servo checkout is pinned to an exact commit; see docs/servo-version.md.
 # It is kept on disk (we build against it by path) but is not part of this repo.
-servo/
+/servo/
 
 # GStreamer for the `media` feature, unpacked by scripts/fetch-gstreamer.ps1.
-deps/
+/deps/
 
 # Local scratch
 *.log

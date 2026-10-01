@@ -12,7 +12,7 @@ Single source of truth for which Servo revision this project is written against.
 | Commit subject | `android: Remove `RunCallback` abstraction (#48517)` |
 | Workspace version | `0.6.0` |
 | Clone location | `servo/` (shallow, `--depth 1`) |
-| Local modifications | **none** — `git status --porcelain` is empty |
+| Local modifications | only the patches in `patches/servo/` (see "Local patches") |
 
 Because the clone is shallow, upstream history is unavailable locally. To move to
 a different revision: `git -C servo fetch --depth 1 origin <ref>` then
@@ -83,7 +83,14 @@ versioning scheme** and do not correspond to `0.6.0`. Do not assume
 
 ## Local patches
 
-**None.** Servo is used as an unmodified path dependency.
+Kept as patch files in `patches/servo/` and applied to the pinned checkout by
+`scripts/apply-servo-patches.ps1` (CI runs it after cloning). Run it after any
+fresh checkout or `git checkout` of `servo/`.
+
+| Patch | File | Why | Remove when |
+| --- | --- | --- | --- |
+| `0001-root-timers-while-firing.patch` | `components/script/event_loop/timers.rs` | **Crash (use-after-free) on YouTube's first load.** `OneshotTimers::fire_timer` moved every due timer into a local `Vec` before running them. A `TracedCallback` is only safe in a GC-traced location, so when one callback triggered a GC, the callbacks still waiting in the `Vec` were freed or moved, and the next one crashed in `JS::GetNonCCWObjectGlobal` reading poisoned memory (`0x4b4b…`). The patch keeps the batch in a traced field, `timers_to_run`, and takes each timer out only immediately before it runs. Found with a minidump; see devlog entry 015. | Upstream `fire_timer` stops holding timers in an untraced local (still present on Servo `main` as of 2026-10-01). Worth reporting upstream. |
+| `0002-video-frames-without-relayout.patch` | `components/script/dom/html/embedded_content/htmlmediaelement.rs` | **Video plays at half rate and freezes heavy pages.** `playback_video_frame_updated` marked the `<video>` node dirty for every decoded frame, forcing a restyle and relayout of the whole page per frame, although the frame had already been sent as an in-place update of the same WebRender image key. On a page with a large DOM, a 24 fps clip showed 10.6 frames/s and the page ran at 11 fps; with the patch, 24-25 frames/s and 41-44 fps. When the size is unchanged it now requests a new frame the way animated images do (`set_has_pending_animated_image_update`). A size change still takes the old path. Devlog entry 015. | Upstream stops dirtying the node per video frame. Worth reporting upstream. |
 
 For reference, upstream Servo's own `[patch.crates-io]` section
 (`servo/Cargo.toml:444+`) is entirely commented out — upstream currently patches

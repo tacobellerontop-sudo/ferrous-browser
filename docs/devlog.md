@@ -1511,3 +1511,101 @@ errors were logged.
   `currentTime` advances.
 - `canPlayType('audio/ogg; codecs="opus"')` returns `""` although the `gstopus`
   and `gstogg` plugins are staged. Not investigated.
+
+---
+
+## 2026-10-01 — Entry 015: YouTube video lag, and a crash on first load (two Servo patches)
+
+User report: on YouTube, opening a video directly says it cannot play. Going to
+the home page and clicking a video plays it, but with "low FPS" and poor
+graphics. The user asked whether Hermes had a solution.
+
+### Hermes
+
+It does not. Its docs say YouTube does not work in Hermes either (no
+`MediaSource`). Its vendored `servo-media-gstreamer` fixes Linux codec
+detection, diagnostics, Web Audio and lifecycle issues, and deliberately uses
+the CPU (BGRA) frame path. Nothing in it addresses frame rate.
+
+### Why some YouTube videos play at all
+
+Without `MediaSource`, YouTube's player can only use a progressive format.
+**Direct load:** the player response embedded in the watch page carries only
+adaptive (MSE) formats, so the player gives up. **In-page (SPA) navigation:**
+the player fetches its data again and gets **itag 18**, a progressive
+640x360 H.264/AAC MP4, which our GStreamer build plays. That 360p, scaled up to
+the ~950 px player, is the "poor graphics". Nothing on our side can fix that
+without `MediaSource`.
+
+### Crash: use-after-free in Servo's timers (patch 0001)
+
+While reproducing, Ferrous died silently (exit 139) on 3 of 7 direct loads of a
+watch page, with no panic and no Windows Error Reporting event. A temporary
+`SetUnhandledExceptionFilter` that wrote a minidump (`MiniDumpWriteDump`), opened
+in LLVM's `lldb`, gave the stack: thread `Script#1`, access violation in
+`JS::GetNonCCWObjectGlobal` reading a shape at `0x4b4b4b4b…` (SpiderMonkey's
+poison for freed GC memory), called from `OneshotTimers::fire_timer` →
+`JsTimerTask::invoke`. Running lldb live was useless: it stops on
+SpiderMonkey's benign first-chance exceptions and the window freezes.
+
+`fire_timer` moved every due timer into a local `Vec` and then ran them in turn.
+A `TracedCallback` is only safe where the GC traces it; when one callback
+triggered a GC, the callbacks still in the `Vec` were swept or moved, and the
+next call read freed memory. Servo `main` still has this code. The patch keeps
+the batch in a traced `timers_to_run` field and takes each timer out only just
+before it runs. Result: 0 crashes in 8 runs (it was 3 in 7).
+
+### Lag: a relayout per video frame (patch 0002)
+
+Measured with a screen-sampling meter (40 samples/s of the video area, counting
+frames that change; calibrated against a 24 fps clip at 24.4 changes/s) and
+Servo's time profiler (`Opts::time_profiling` with a trace file).
+`HTMLMediaElement::playback_video_frame_updated` called
+`dirty(NodeDamage::Other)` on the video node for **every decoded frame**. The
+frame's pixels had already been sent to WebRender as an in-place `UpdateImage`
+of the same image key, so the display list was unchanged; the dirtying only
+forced a restyle and relayout of the whole page. On YouTube that relayout costs
+80-130 ms during page build-up, so 30 of them a second saturated the script
+thread: page at 1-3 fps, timers 3-4 s late, video frozen for 3.5-4 s at a time.
+
+The patch requests a new frame instead, through the flag animated images use
+(`set_has_pending_animated_image_update`), when the size is unchanged. A size
+change still takes the original path.
+
+A/B on a deterministic local page (6,000 grid cards plus the 24 fps MDN clip),
+same build except this patch:
+
+| | Video frames on screen | Page rAF | Worst timer lag |
+| --- | --- | --- | --- |
+| Before | 10.6 /s (gaps ~93 ms) | 11 fps | 53-91 ms |
+| After | 24-25 /s (gaps ~35 ms) | 41-44 fps | 16 ms |
+
+On YouTube, steady playback after the patch measured 33-36 changes/s.
+
+### What still lags
+
+Shortly after a video is opened, YouTube's own scripts make 200-600 forced
+layout reads a second (`clientWidth`/`clientHeight`, `getComputedStyle`,
+`getBoundingClientRect`) between DOM writes. In Servo each costs a full
+style-and-layout pass of ~2.5 ms on YouTube's DOM, so layout fills 600-950 ms of
+a second for a few seconds at a time: freezes of roughly 1-2 s around
+navigation and ad transitions. This is Servo layout performance (incremental
+layout on a very large DOM), not something a site intervention can remove.
+`layout_threads` is 3 on this 6-core machine; it was not changed, because
+forced layout reads mostly lay out small regions.
+
+### How the patches are kept
+
+`servo/` stays a pinned upstream checkout. The patches live in `patches/servo/`
+and `scripts/apply-servo-patches.ps1` applies them; it is idempotent, and it
+refuses a checkout the patches do not fit. CI runs it after cloning. Both are
+listed in `docs/servo-version.md` with removal conditions. `.gitignore`'s
+`servo/` rule matched any folder of that name, including `patches/servo/`; it is
+now anchored to the root (`/servo/`, `/deps/`).
+
+### Not done
+
+- Direct loads of a watch page still cannot play (adaptive formats only). A
+  site intervention that makes YouTube fetch its player data again could fix
+  that; not attempted.
+- Neither patch has been reported upstream yet.

@@ -1,0 +1,64 @@
+diff --git a/components/script/event_loop/timers.rs b/components/script/event_loop/timers.rs
+index eb16fa5fb..80cd3c04d 100644
+--- a/components/script/event_loop/timers.rs
++++ b/components/script/event_loop/timers.rs
+@@ -82,6 +82,11 @@ pub(crate) struct OneshotTimers {
+     js_timers: JsTimers,
+     next_timer_handle: Cell<OneshotTimerHandle>,
+     timers: DomRefCell<VecDeque<OneshotTimer>>,
++    /// Timers taken out of `timers` by `fire_timer` that have not run yet.
++    /// They must stay in a GC-traced location until they run: running one can
++    /// trigger a garbage collection, and their `TracedCallback`s are not
++    /// traced (or updated by a moving GC) anywhere else.
++    timers_to_run: DomRefCell<VecDeque<OneshotTimer>>,
+     suspended_since: Cell<Option<Instant>>,
+     /// Initially 0, increased whenever the associated document is reactivated
+     /// by the amount of ms the document was inactive. The current time can be
+@@ -196,6 +201,7 @@ impl OneshotTimers {
+             js_timers: JsTimers::default(),
+             next_timer_handle: Cell::new(OneshotTimerHandle(1)),
+             timers: DomRefCell::new(VecDeque::new()),
++            timers_to_run: DomRefCell::new(VecDeque::new()),
+             suspended_since: Cell::new(None),
+             suspension_offset: Cell::new(Duration::ZERO),
+             expected_event_id: Cell::new(TimerEventId(0)),
+@@ -348,24 +354,31 @@ impl OneshotTimers {
+ 
+         // select timers to run to prevent firing timers
+         // that were installed during fire of another timer
+-        let mut timers_to_run = Vec::new();
+-
+-        loop {
++        {
+             let mut timers = self.timers.borrow_mut();
++            let mut timers_to_run = self.timers_to_run.borrow_mut();
+ 
+-            if timers.is_empty() || timers.back().unwrap().scheduled_for > base_time {
+-                break;
++            while timers
++                .back()
++                .is_some_and(|timer| timer.scheduled_for <= base_time)
++            {
++                timers_to_run.push_back(timers.pop_back().unwrap());
+             }
+-
+-            timers_to_run.push(timers.pop_back().unwrap());
+         }
+ 
+-        for timer in timers_to_run {
++        // Each timer leaves the traced `timers_to_run` only immediately before
++        // it runs; see the field's documentation.
++        loop {
++            let Some(timer) = self.timers_to_run.borrow_mut().pop_front() else {
++                break;
++            };
++
+             // Since timers can be coalesced together inside a task,
+             // this loop can keep running, including after an interrupt of the JS,
+             // and prevent a clean-shutdown of a JS-running thread.
+             // This check prevents such a situation.
+             if !self.global_scope.can_continue_running() {
++                self.timers_to_run.borrow_mut().clear();
+                 return;
+             }
+             match &timer.callback {
