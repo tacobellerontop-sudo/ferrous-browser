@@ -63,6 +63,8 @@ pub struct Tab {
     pub favicon: Option<Favicon>,
     /// Page zoom, 1.0 = 100%.
     pub zoom: f32,
+    /// Ad and tracker requests blocked on the current page.
+    pub blocked: u32,
 }
 
 impl Tab {
@@ -130,6 +132,7 @@ impl Tabs {
             loading: false,
             favicon: None,
             zoom: 1.0,
+            blocked: 0,
         });
         self.active = self.tabs.len() - 1;
         id

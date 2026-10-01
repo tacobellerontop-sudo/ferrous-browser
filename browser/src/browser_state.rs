@@ -21,6 +21,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 
+use crate::blocker::Blocker;
 use crate::tab::{Favicon, Tab, TabId, Tabs};
 
 /// A callback from the engine, waiting to be applied to the tab model.
@@ -31,6 +32,8 @@ pub enum TabEvent {
     HistoryChanged { tab: TabId, can_go_back: bool, can_go_forward: bool },
     LoadStatus { tab: TabId, loading: bool },
     FaviconChanged { tab: TabId, favicon: Option<Favicon> },
+    /// The blocker cancelled one of the tab's requests.
+    RequestBlocked { tab: TabId },
 }
 
 /// State shared between the UI layer and the Servo delegates.
@@ -42,9 +45,20 @@ pub struct BrowserState {
     /// keystrokes must go to the UI rather than to the web page, or typing a
     /// search would both edit the box and scroll the page behind it.
     pub address_focused: Cell<bool>,
+    /// Decides which requests to cancel. Shared here so the engine can consult
+    /// it and the chrome can show and toggle it.
+    pub blocker: Blocker,
     /// Set when Servo reports a new frame, cleared when the frame loop paints
     /// it. Lets the loop skip WebRender entirely on chrome-only frames.
     needs_paint: Cell<bool>,
+}
+
+impl BrowserState {
+    /// The state a running browser starts with: the saved blocker allowlist
+    /// loaded, everything else empty.
+    pub fn new() -> Self {
+        Self { blocker: Blocker::load(), ..Self::default() }
+    }
 }
 
 impl BrowserState {
@@ -101,6 +115,11 @@ impl BrowserState {
                     if host_of(&tab.url) != host_of(&url) {
                         tab.favicon = None;
                     }
+                    // A new page starts a new blocked count. A change of
+                    // fragment alone is the same page.
+                    if without_fragment(&tab.url) != without_fragment(&url) {
+                        tab.blocked = 0;
+                    }
                     tab.url = url.clone();
                     // Never yank text out from under someone mid-keystroke.
                     if !self.address_focused.get() {
@@ -114,6 +133,7 @@ impl BrowserState {
                 }
                 TabEvent::LoadStatus { loading, .. } => tab.loading = loading,
                 TabEvent::FaviconChanged { favicon, .. } => tab.favicon = favicon,
+                TabEvent::RequestBlocked { .. } => tab.blocked += 1,
             }
         }
     }
@@ -159,7 +179,8 @@ fn tab_of(event: &TabEvent) -> TabId {
         | TabEvent::TitleChanged { tab, .. }
         | TabEvent::HistoryChanged { tab, .. }
         | TabEvent::LoadStatus { tab, .. }
-        | TabEvent::FaviconChanged { tab, .. } => *tab,
+        | TabEvent::FaviconChanged { tab, .. }
+        | TabEvent::RequestBlocked { tab } => *tab,
     }
 }
 
@@ -167,6 +188,10 @@ fn tab_of(event: &TabEvent) -> TabId {
 /// the site, in which case the old favicon is dropped.
 fn host_of(url: &str) -> Option<String> {
     url::Url::parse(url).ok()?.host_str().map(str::to_owned)
+}
+
+fn without_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(page, _)| page)
 }
 
 /// `about:blank` is Servo's default document, not somewhere the user navigated
@@ -350,5 +375,23 @@ mod tests {
         state.push_event(TabEvent::UrlChanged { tab: id, url: "https://b.test/".into() });
         state.drain_events();
         assert!(state.tabs().active().favicon.is_none(), "another site's icon is dropped");
+    }
+
+    #[test]
+    fn blocked_requests_count_per_page() {
+        let state = BrowserState::default();
+        let id = state.tabs_mut().create("https://a.test/");
+        state.push_event(TabEvent::RequestBlocked { tab: id });
+        state.push_event(TabEvent::RequestBlocked { tab: id });
+        state.drain_events();
+        assert_eq!(state.tabs().active().blocked, 2);
+
+        state.push_event(TabEvent::UrlChanged { tab: id, url: "https://a.test/#section".into() });
+        state.drain_events();
+        assert_eq!(state.tabs().active().blocked, 2, "a fragment change is the same page");
+
+        state.push_event(TabEvent::UrlChanged { tab: id, url: "https://a.test/next".into() });
+        state.drain_events();
+        assert_eq!(state.tabs().active().blocked, 0, "a new page starts counting again");
     }
 }

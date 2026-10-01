@@ -47,6 +47,7 @@ use winit::window::Window;
 
 mod address;
 mod backdrop;
+mod blocker;
 mod browser_state;
 mod chrome;
 mod engine;
@@ -58,6 +59,7 @@ mod input;
 mod page_mask;
 mod prefs;
 mod scroll;
+mod storage;
 mod tab;
 mod theme;
 mod titlebar;
@@ -291,7 +293,7 @@ impl ApplicationHandler<WakerEvent> for App {
             });
         }
 
-        let state = Rc::new(BrowserState::default());
+        let state = Rc::new(BrowserState::new());
         let engine = WebEngine::new(
             offscreen_ctx.clone(),
             window.clone(),
@@ -959,6 +961,18 @@ fn apply_action(
         }
         Action::CloseTab(id) => return close_tab(engine, state, id),
         Action::ResetZoom => set_zoom(engine, chrome, state, 1.0),
+        Action::ToggleBlocking => {
+            let host = url::Url::parse(&state.active_tab().url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned));
+            if let Some(host) = host {
+                let allowed = state.blocker.toggle_allowed(&host);
+                info!("blocker: {} {host}", if allowed { "allowed" } else { "blocking" });
+                // Reload so the page reflects the change straight away.
+                state.note_loading_started();
+                engine.reload();
+            }
+        }
     }
     false
 }

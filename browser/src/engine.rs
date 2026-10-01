@@ -33,7 +33,7 @@ use euclid::Scale;
 use log::info;
 use servo::{
     DeviceIndependentPixel, DevicePixel, EventLoopWaker, Image, InputEvent, LoadStatus, PixelFormat,
-    RenderingContext,
+    RenderingContext, WebResourceLoad, WebResourceResponse,
     Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use servo::protocol_handler::ProtocolRegistry;
@@ -372,6 +372,22 @@ impl WebViewDelegate for TabDelegate {
         // CPU near zero. URL and title callbacks do NOT prove anything rendered.
         self.state.mark_needs_paint();
         self.redraw.request();
+    }
+
+    /// Every request a page makes passes through here first. Ones the blocker
+    /// matches are cancelled, which the page sees as a network error — the same
+    /// as an extension-based blocker. Anything not intercepted continues
+    /// untouched once `load` is dropped.
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let request = load.request();
+        let page = webview.url();
+        if self.state.blocker.should_block(&request.url, page.as_ref(), request.is_for_main_frame) {
+            log::debug!("blocked {}", request.url);
+            let url = request.url.clone();
+            load.intercept(WebResourceResponse::new(url)).cancel();
+            self.state.push_event(TabEvent::RequestBlocked { tab: self.tab });
+            self.redraw.request();
+        }
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {

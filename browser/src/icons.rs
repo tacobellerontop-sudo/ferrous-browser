@@ -115,6 +115,29 @@ pub fn search(painter: &Painter, center: Pos2, color: Color32) {
     );
 }
 
+/// A shield, for the ad blocker. `active` fills it; inactive draws the outline
+/// struck through.
+pub fn shield(painter: &Painter, center: Pos2, color: Color32, active: bool) {
+    let outline: Vec<Pos2> = [
+        (-5.5, -5.5),
+        (0.0, -7.5),
+        (5.5, -5.5),
+        (5.5, -0.5),
+        (3.6, 3.8),
+        (0.0, 7.0),
+        (-3.6, 3.8),
+        (-5.5, -0.5),
+    ]
+    .into_iter()
+    .map(|(x, y)| center + vec2(x, y))
+    .collect();
+    let fill = if active { color.gamma_multiply(0.28) } else { Color32::TRANSPARENT };
+    painter.add(Shape::convex_polygon(outline, fill, Stroke::new(1.4_f32, color)));
+    if !active {
+        painter.line_segment([center + vec2(-6.5, 6.5), center + vec2(6.5, -6.5)], Stroke::new(1.4_f32, color));
+    }
+}
+
 /// A plus sign, for the New Tab control.
 pub fn plus(painter: &Painter, center: Pos2, color: Color32) {
     const ARM: f32 = 5.0;

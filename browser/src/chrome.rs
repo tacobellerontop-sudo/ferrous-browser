@@ -86,6 +86,9 @@ const ZOOM_BUBBLE_SECS: f64 = 1.2;
 const ZOOM_BUBBLE_FADE: f64 = 0.3;
 /// Room at the right of the address pill for the zoom badge, when shown.
 const ZOOM_BADGE_WIDTH: f32 = 50.0;
+/// The blocker's shield: icon only, or icon plus a count.
+const SHIELD_WIDTH: f32 = 28.0;
+const SHIELD_WITH_COUNT_WIDTH: f32 = 50.0;
 
 /// Toolbar row, below the title row.
 const TOOLBAR_HEIGHT: f32 = 44.0;
@@ -126,6 +129,8 @@ pub enum Action {
     SelectTab(TabId),
     /// Back to 100%, from the zoom badge in the address bar.
     ResetZoom,
+    /// Turn ad blocking off for the current site, or back on.
+    ToggleBlocking,
 }
 
 /// What the chrome produced this frame.
@@ -419,6 +424,42 @@ impl Chrome {
         painter.galley_with_override_text_color(pos, galley, theme::TEXT.gamma_multiply(alpha));
     }
 
+    /// The blocker's shield: lit while blocking is on for `site`, with the
+    /// number of requests blocked on this page; struck through while the site
+    /// is allowed. Clicking toggles it.
+    fn shield(&self, ui: &mut Ui, rect: Rect, site: &str, blocked: u32, actions: &mut Vec<Action>) {
+        let allowed = self.state.blocker.is_allowed(site);
+        let response = ui.interact(rect, Id::new("ferrous.shield"), Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, rect.height() / 2.0, theme::HOVER);
+        }
+        let icon_center = pos2(rect.left() + SHIELD_WIDTH / 2.0, rect.center().y);
+        let color = if allowed { theme::TEXT_FAINT } else { theme::ACCENT };
+        icons::shield(ui.painter(), icon_center, color, !allowed);
+        if blocked > 0 && !allowed {
+            ui.painter().text(
+                pos2(rect.left() + SHIELD_WIDTH - 2.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                if blocked > 99 { "99+".to_owned() } else { blocked.to_string() },
+                FontId::proportional(11.5),
+                theme::TEXT_WEAK,
+            );
+        }
+        if response.clicked() {
+            actions.push(Action::ToggleBlocking);
+        }
+        response.on_hover_text(if allowed {
+            format!("Ad and tracker blocking is off for {site}.\nClick to turn it back on.")
+        } else {
+            let what = match blocked {
+                0 => "Nothing blocked on this page yet.".to_owned(),
+                1 => "Blocked 1 ad or tracker on this page.".to_owned(),
+                n => format!("Blocked {n} ads and trackers on this page."),
+            };
+            format!("{what}\nClick to allow them on {site}.")
+        });
+    }
+
     /// The texture for `tab`'s icon, uploading it the first time a given icon
     /// version is seen.
     fn favicon_texture(&mut self, ctx: &egui::Context, tab: &Tab, icon: &Favicon) -> egui::TextureId {
@@ -665,6 +706,12 @@ impl Chrome {
 
         let page_zoom = tabs.active().zoom;
         let zoomed = zoom::percent(page_zoom) != 100;
+        let blocked = tabs.active().blocked;
+        // The shield only means something on web pages, not the homepage.
+        let site = url::Url::parse(&committed)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .and_then(|u| u.host_str().map(str::to_owned));
 
         let text = &mut tabs.active_mut().address_text;
 
@@ -682,9 +729,16 @@ impl Chrome {
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
-        // A zoom badge at the right end while the page is not at 100%; it
-        // resets the zoom when clicked.
-        let right_inset = if zoomed { ZOOM_BADGE_WIDTH + 6.0 } else { 12.0 };
+        // Badges at the right end, outermost first: the blocker's shield, then
+        // the zoom level while the page is not at 100%.
+        let shield_width = match (&site, blocked) {
+            (None, _) => 0.0,
+            (Some(_), 0) => SHIELD_WIDTH,
+            (Some(_), _) => SHIELD_WITH_COUNT_WIDTH,
+        };
+        let zoom_width = if zoomed { ZOOM_BADGE_WIDTH } else { 0.0 };
+        let badges = shield_width + zoom_width;
+        let right_inset = if badges > 0.0 { badges + 10.0 } else { 12.0 };
         let field = Rect::from_min_max(pill.min + vec2(ADDRESS_ICON_SLOT, 0.0), pill.max - vec2(right_inset, 0.0));
         let response = ui.put(
             field,
@@ -719,9 +773,17 @@ impl Chrome {
             RectShape::new(pill, radius, fill, stroke, StrokeKind::Inside),
         );
 
+        if let Some(site) = &site {
+            let shield = Rect::from_min_size(
+                pos2(pill.right() - shield_width - 4.0, pill.top() + 4.0),
+                vec2(shield_width, pill.height() - 8.0),
+            );
+            self.shield(ui, shield, site, blocked, actions);
+        }
+
         if zoomed {
             let badge = Rect::from_min_size(
-                pos2(pill.right() - ZOOM_BADGE_WIDTH - 4.0, pill.top() + 4.0),
+                pos2(pill.right() - shield_width - ZOOM_BADGE_WIDTH - 6.0, pill.top() + 4.0),
                 vec2(ZOOM_BADGE_WIDTH, pill.height() - 8.0),
             );
             let response = ui.interact(badge, Id::new("ferrous.zoom_badge"), Sense::click());

@@ -14,7 +14,7 @@
 //! pure except [`load`] and [`save`], so the parsing and the "is it still on a
 //! screen?" check are unit tested.
 
-use std::path::PathBuf;
+use crate::storage;
 
 /// Smallest window the browser will open at or be resized to, in physical
 /// pixels at 100% scale. Below this the tab strip, toolbar and window controls
@@ -118,30 +118,17 @@ pub fn is_normal_placement(x: i32, y: i32, width: u32, height: u32) -> bool {
     x > -32000 && y > -32000 && width >= 100 && height >= 100
 }
 
-fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join("Ferrous").join("window.txt"))
-}
+const FILE: &str = "window.txt";
 
 /// Read the saved state, if there is any. Missing or unreadable files are
 /// normal (first run), so they are not errors.
 pub fn load() -> Option<WindowState> {
-    let text = std::fs::read_to_string(path()?).ok()?;
-    WindowState::from_text(&text)
+    WindowState::from_text(&storage::read(FILE)?)
 }
 
-/// Write the state. Written to a temporary file and renamed into place, so a
-/// crash mid-write leaves the previous file intact rather than a truncated one.
+/// Write the state. See `storage::write` for why this cannot truncate it.
 pub fn save(state: WindowState) -> std::io::Result<()> {
-    let Some(path) = path() else {
-        return Ok(());
-    };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, state.to_text())?;
-    std::fs::rename(&temp, &path)
+    storage::write(FILE, &state.to_text())
 }
 
 #[cfg(test)]
