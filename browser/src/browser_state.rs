@@ -41,6 +41,21 @@ pub struct BrowserState {
     /// keystrokes must go to the UI rather than to the web page, or typing a
     /// search would both edit the box and scroll the page behind it.
     pub address_focused: Cell<bool>,
+    /// Set when Servo reports a new frame, cleared when the frame loop paints
+    /// it. Lets the loop skip WebRender entirely on chrome-only frames.
+    needs_paint: Cell<bool>,
+}
+
+impl BrowserState {
+    /// Note that Servo has a new frame for the page.
+    pub fn mark_needs_paint(&self) {
+        self.needs_paint.set(true);
+    }
+
+    /// Whether a page paint is due, clearing the flag.
+    pub fn take_needs_paint(&self) -> bool {
+        self.needs_paint.replace(false)
+    }
 }
 
 impl BrowserState {
@@ -106,7 +121,21 @@ impl BrowserState {
         let tab = tabs.active_mut();
         tab.url = url.to_owned();
         tab.address_text = url.to_owned();
+        tab.loading = true;
         self.address_focused.set(false);
+    }
+
+    /// Show the active tab as loading from the moment the browser asks for a
+    /// navigation (Back, Forward, Reload; typed addresses go through
+    /// [`Self::note_requested_navigation`]).
+    ///
+    /// Servo's first load event, `LoadStatus::Started`, arrives when the
+    /// navigation *commits*, which can be after the whole response is in: a
+    /// page served over 8 seconds reported `Started` and `Complete` 4ms apart at
+    /// the very end. Without this, every loading indicator was invisible for
+    /// the whole wait. `Complete` still clears it as before.
+    pub fn note_loading_started(&self) {
+        self.tabs.borrow_mut().active_mut().loading = true;
     }
 
     /// Pending event count. Test-facing; also useful when debugging why a tab
@@ -128,9 +157,14 @@ fn tab_of(event: &TabEvent) -> TabId {
 
 /// `about:blank` is Servo's default document, not somewhere the user navigated
 /// to. Showing "about:blank" in the address bar on a fresh tab reads as an error,
-/// so it is displayed as nothing at all.
+/// so it is displayed as nothing at all. The homepage likewise: an empty bar with
+/// its "Search or enter address" hint is the invitation to type.
 fn display_url(url: &str) -> String {
-    if url == "about:blank" { String::new() } else { url.to_owned() }
+    if url == "about:blank" || crate::homepage::is_homepage(url) {
+        String::new()
+    } else {
+        url.to_owned()
+    }
 }
 
 /// Convenience for UI code that only needs the active tab.
@@ -256,5 +290,20 @@ mod tests {
         state.push_event(TabEvent::UrlChanged { tab: id, url: "https://two.test/".into() });
         state.drain_events();
         assert_eq!(state.tabs().active().url, "https://two.test/");
+    }
+
+    #[test]
+    fn a_requested_navigation_shows_as_loading_until_complete() {
+        let state = BrowserState::default();
+        let id = state.tabs_mut().create("https://servo.org");
+        state.note_requested_navigation("https://example.com/");
+        assert!(state.tabs().active().loading, "loading from the request, not the commit");
+
+        state.push_event(TabEvent::LoadStatus { tab: id, loading: false });
+        state.drain_events();
+        assert!(!state.tabs().active().loading);
+
+        state.note_loading_started();
+        assert!(state.tabs().active().loading);
     }
 }

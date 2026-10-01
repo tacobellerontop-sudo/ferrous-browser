@@ -14,7 +14,7 @@ use url::Url;
 /// (`javascript:`, `data:`, `file:` are all reachable another way, or not at
 /// all, and silently navigating to them from an address bar is how browsers end
 /// up executing attacker-supplied script).
-const SUPPORTED_SCHEMES: [&str; 3] = ["http", "https", "about"];
+const SUPPORTED_SCHEMES: [&str; 4] = ["http", "https", "about", crate::homepage::SCHEME];
 
 const SEARCH_ENDPOINT: &str = "https://duckduckgo.com/";
 

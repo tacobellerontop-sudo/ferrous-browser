@@ -23,6 +23,7 @@
 use egui::{Rect, Sense, Ui};
 
 use crate::icons::{self, WindowIcon};
+use crate::theme;
 
 /// What the user asked the *window* (not the page) to do.
 ///
@@ -50,38 +51,36 @@ pub enum ResizeEdge {
 }
 
 /// How far from the window edge counts as a resize grab, in egui points.
-/// Close to the native Windows frame thickness, so it feels familiar.
-pub const RESIZE_BORDER: f32 = 5.0;
+/// Matches the gap around the page card (`chrome::GAP`), so the whole visible
+/// margin is the grip, as it would be on a native frame.
+pub const RESIZE_BORDER: f32 = 8.0;
 
-/// Height of the custom title bar.
-pub const TITLE_BAR_HEIGHT: f32 = 30.0;
+/// Height of the custom title bar. The tab strip lives in this row.
+pub const TITLE_BAR_HEIGHT: f32 = 38.0;
 
-const BUTTON_WIDTH: f32 = 34.0;
-const CONTROL_WIDTH: f32 = BUTTON_WIDTH * 3.0;
+/// 46 wide is the native Windows 10/11 caption button width, so the controls sit
+/// where muscle memory expects them.
+const BUTTON_WIDTH: f32 = 46.0;
+pub const CONTROL_WIDTH: f32 = BUTTON_WIDTH * 3.0;
 
-/// The drag strip, in egui points, for a window `width` points wide.
-///
-/// **This must agree with what [`draw`] allocates.** The title-bar panel is
-/// created with zero inner margin for exactly that reason: with egui's default
-/// 8pt margin the painted strip and the hit-test region would silently disagree,
-/// and the difference would only show up as clicks landing a few pixels off.
-///
-/// The strip is not an egui widget. It is painted only. Hit testing lives here,
-/// in [`is_in_drag_area`], so that a drag can never accumulate egui interaction
-/// state — see the note on `drag_title_bar`.
-pub fn drag_rect(width: f32) -> Rect {
-    Rect::from_min_size(
-        egui::pos2(0.0, 0.0),
-        egui::vec2((width - CONTROL_WIDTH).max(0.0), TITLE_BAR_HEIGHT),
-    )
+/// The right end of a title `row`, where the three window controls sit.
+pub fn controls_rect(row: Rect) -> Rect {
+    Rect::from_min_max(egui::pos2(row.right() - CONTROL_WIDTH, row.top()), row.max)
 }
 
 /// Whether a press at `point` should start a title-bar drag.
 ///
-/// `drag_rect` is half-open, so the window controls sitting immediately to its
-/// right are excluded automatically and their presses fall through to egui.
-pub fn is_in_drag_area(point: egui::Pos2, width: f32) -> bool {
-    drag_rect(width).contains(point)
+/// `row` is where the title row was drawn last frame, or [`Rect::NOTHING`]
+/// while the chrome is hidden — the page is under the pointer then, and a press
+/// at the top of a page must reach the page. `tabs` is the area the tabs and
+/// the new-tab button occupied; presses there belong to the tabs. The window
+/// controls at the right end of the row are excluded too, so their presses fall
+/// through to egui.
+///
+/// The drag area is not an egui widget, and hit testing lives here, so that a
+/// drag can never accumulate egui interaction state — see `drag_title_bar`.
+pub fn is_in_drag_area(point: egui::Pos2, row: Rect, tabs: Rect) -> bool {
+    row.contains(point) && !controls_rect(row).contains(point) && !tabs.contains(point)
 }
 
 /// Which edge, if any, a point sits on. `None` means the interior.
@@ -115,82 +114,72 @@ pub fn resize_edge_at(point: egui::Pos2, window: Rect) -> Option<ResizeEdge> {
     }
 }
 
-/// Draw the title bar and return the window commands the user triggered.
-pub fn draw(ui: &mut Ui, title: &str, maximized: bool) -> Vec<WindowCommand> {
+/// The pointer shape for a resize edge, so the border advertises itself.
+pub fn resize_cursor(edge: ResizeEdge) -> egui::CursorIcon {
+    use egui::CursorIcon::*;
+    match edge {
+        ResizeEdge::Left | ResizeEdge::Right => ResizeHorizontal,
+        ResizeEdge::Top | ResizeEdge::Bottom => ResizeVertical,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => ResizeNwSe,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => ResizeNeSw,
+    }
+}
+
+/// Draw the minimize/maximize/close buttons into `rect`, which must be the
+/// rightmost [`CONTROL_WIDTH`] of the title bar, and return the window commands
+/// the user triggered.
+///
+/// The rest of the row is the tab strip and the drag area, both of which the
+/// caller draws. The drag area itself is never an egui widget: it is hit tested
+/// geometrically in [`is_in_drag_area`]. Giving egui a draggable widget there
+/// meant `dragged()` stayed true for as long as the pointer was down, and it
+/// queued a native drag every frame; `WM_NCLBUTTONDOWN` pumps messages, so each
+/// one re-entered the frame loop and queued another. One title-bar drag was
+/// measured burning 609ms of CPU over the following 4 seconds, with the UI
+/// unresponsive. See the note on `drag_title_bar`.
+pub fn controls(ui: &mut Ui, rect: Rect, maximized: bool) -> Vec<WindowCommand> {
     let mut commands = Vec::new();
 
-    // Window controls are contiguous on every other window on the platform, and
-    // they have to be: `CONTROL_WIDTH` reserves exactly `3 * BUTTON_WIDTH` for
-    // them, so the default inter-item spacing would push the last one off the
-    // right edge. This runs inside the title-bar panel's own `Ui`, so the change
-    // does not leak into the toolbar below.
-    ui.spacing_mut().item_spacing.x = 0.0;
-
-    ui.horizontal(|ui| {
-        // The drag strip occupies everything except the three control buttons.
-        let drag_width = (ui.available_width() - CONTROL_WIDTH).max(0.0);
-        // `Sense::hover`, NOT `click_and_drag`. This is the important line in
-        // the file. Giving egui a draggable widget here meant `dragged()` stayed
-        // true for as long as the pointer was down, and it queued a native drag
-        // every frame; `WM_NCLBUTTONDOWN` pumps messages, so each one re-entered
-        // the frame loop and queued another. Windows holds the mouse during the
-        // drag, so the release event never reached us and the nesting never
-        // unwound — one title-bar drag was measured burning 609ms of CPU over
-        // the following 4 seconds, with the UI unresponsive. The strip is now
-        // painted only; the drag is started from the mouse-down handler by
-        // geometric hit test, so no egui interaction state can exist at all.
-        // egui 0.34 returns (rect, response) in that order.
-        let (strip, _strip_response) = ui.allocate_exact_size(
-            egui::vec2(drag_width, TITLE_BAR_HEIGHT),
-            Sense::hover(),
+    // Left-to-right, matching the Windows convention. Laid out by hand, not by
+    // `ui.horizontal`, so inter-item spacing cannot push the last button off the
+    // right edge of the window.
+    let buttons = [
+        (WindowIcon::Minimize, "Minimize", WindowCommand::Minimize),
+        (
+            if maximized { WindowIcon::Restore } else { WindowIcon::Maximize },
+            if maximized { "Restore" } else { "Maximize" },
+            WindowCommand::ToggleMaximize,
+        ),
+        (WindowIcon::Close, "Close", WindowCommand::Close),
+    ];
+    for (i, (icon, tip, command)) in buttons.into_iter().enumerate() {
+        let button = Rect::from_min_size(
+            egui::pos2(rect.left() + i as f32 * BUTTON_WIDTH, rect.top()),
+            egui::vec2(BUTTON_WIDTH, rect.height()),
         );
+        let response = ui.interact(button, ui.id().with(("window_control", i)), Sense::click());
 
-        let painter = ui.painter().clone();
-        painter.rect_filled(strip, 0.0, ui.visuals().widgets.noninteractive.bg_fill);
-        painter.text(
-            strip.center(),
-            egui::Align2::CENTER_CENTER,
-            title,
-            egui::FontId::proportional(12.0),
-            ui.visuals().text_color(),
-        );
+        if response.clicked() {
+            commands.push(command);
+        }
 
-        // Left-to-right, matching the Windows convention. `ui.horizontal` lays
-        // out in order, so the array order is the visual order.
-        ui.horizontal(|ui| {
-            for (icon, tip, command) in [
-                (WindowIcon::Minimize, "Minimize", WindowCommand::Minimize),
-                (
-                    if maximized { WindowIcon::Restore } else { WindowIcon::Maximize },
-                    if maximized { "Restore" } else { "Maximize" },
-                    WindowCommand::ToggleMaximize,
-                ),
-                (WindowIcon::Close, "Close", WindowCommand::Close),
-            ] {
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(BUTTON_WIDTH, TITLE_BAR_HEIGHT),
-                    Sense::click(),
-                );
+        // A rounded wash on hover rather than Windows' full-height block,
+        // which would square off the floating panel's rounded corner. Close
+        // still turns red with a white glyph, as on every Windows window.
+        let (fill, color) = match (icon, response.hovered(), response.is_pointer_button_down_on()) {
+            (WindowIcon::Close, true, _) => (Some(theme::CLOSE_HOVER), egui::Color32::WHITE),
+            (_, true, true) => (Some(theme::PRESS), theme::TEXT),
+            (_, true, false) => (Some(theme::HOVER), theme::TEXT),
+            _ => (None, theme::TEXT_WEAK),
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(button.shrink2(egui::vec2(5.0, 6.0)), 7.0, fill);
+        }
+        icons::window(ui.painter(), button.center(), icon, color);
 
-                if response.clicked() {
-                    commands.push(command);
-                }
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-
-                let color = match (icon, response.hovered()) {
-                    (WindowIcon::Close, true) => icons::CLOSE_HOVER,
-                    (_, true) => ui.visuals().strong_text_color(),
-                    _ => ui.visuals().weak_text_color(),
-                };
-                icons::window(ui.painter(), rect.center(), icon, color);
-
-                // Last, because `on_hover_text` consumes the `Response`.
-                response.on_hover_text(tip);
-            }
-        });
-    });
+        // Last, because `on_hover_text` consumes the `Response`.
+        response.on_hover_text(tip);
+    }
 
     commands
 }
@@ -374,40 +363,53 @@ mod tests {
         assert_eq!(resize_edge_at(egui::pos2(900.0, 700.0), w), None);
     }
 
-    const W: f32 = 800.0;
+    /// A title row at the window origin, 800 wide.
+    fn row() -> Rect {
+        Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, TITLE_BAR_HEIGHT))
+    }
+
+    /// No tab strip at all, for tests that are about the row's outer bounds.
+    const NO_TABS: Rect = Rect::NOTHING;
 
     #[test]
-    fn drag_area_spans_the_strip_but_not_the_controls() {
-        assert!(is_in_drag_area(egui::pos2(10.0, 5.0), W));
-        assert!(is_in_drag_area(egui::pos2(400.0, 15.0), W));
+    fn drag_area_spans_the_row_but_not_the_controls() {
+        assert!(is_in_drag_area(egui::pos2(10.0, 5.0), row(), NO_TABS));
+        assert!(is_in_drag_area(egui::pos2(400.0, 15.0), row(), NO_TABS));
 
         // The rightmost `CONTROL_WIDTH` belongs to the three buttons, which egui
         // handles. If this ever returned true the buttons would be dead.
-        assert!(!is_in_drag_area(egui::pos2(W - CONTROL_WIDTH + 0.5, 15.0), W));
-        assert!(!is_in_drag_area(egui::pos2(W - 1.0, 15.0), W));
+        assert!(!is_in_drag_area(egui::pos2(800.0 - CONTROL_WIDTH + 0.5, 15.0), row(), NO_TABS));
+        assert!(!is_in_drag_area(egui::pos2(799.0, 15.0), row(), NO_TABS));
     }
 
     #[test]
-    fn drag_area_stops_at_the_bottom_of_the_strip() {
-        assert!(is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT - 0.5), W));
+    fn drag_area_stops_at_the_bottom_of_the_row() {
+        assert!(is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT - 0.5), row(), NO_TABS));
         // The toolbar starts here, and must stay clickable.
-        assert!(!is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT + 1.0), W));
+        assert!(!is_in_drag_area(egui::pos2(400.0, TITLE_BAR_HEIGHT + 1.0), row(), NO_TABS));
     }
 
     #[test]
-    fn drag_area_is_anchored_at_the_window_origin() {
-        // The title-bar panel is created with zero inner margin precisely so this
-        // holds. With egui's default 8pt margin the painted strip would start 8pt
-        // lower than the hit test expects.
-        assert_eq!(drag_rect(W).min, egui::pos2(0.0, 0.0));
-        assert_eq!(drag_rect(W).width(), W - CONTROL_WIDTH);
-        assert_eq!(drag_rect(W).height(), TITLE_BAR_HEIGHT);
+    fn tabs_are_not_a_drag_area_but_the_space_around_them_is() {
+        let tabs = Rect::from_min_max(egui::pos2(8.0, 6.0), egui::pos2(300.0, TITLE_BAR_HEIGHT));
+        assert!(!is_in_drag_area(egui::pos2(100.0, 20.0), row(), tabs));
+        assert!(is_in_drag_area(egui::pos2(100.0, 3.0), row(), tabs), "above the tabs");
+        assert!(is_in_drag_area(egui::pos2(400.0, 20.0), row(), tabs), "right of the tabs");
     }
 
     #[test]
-    fn narrow_windows_do_not_produce_a_negative_drag_area() {
-        let rect = drag_rect(40.0);
-        assert_eq!(rect.width(), 0.0, "width must clamp, not go negative");
-        assert!(!is_in_drag_area(egui::pos2(10.0, 10.0), 40.0));
+    fn a_floating_row_is_hit_tested_where_it_is() {
+        // The chrome panel floats inside the window margin, not at the origin.
+        let floating = row().translate(egui::vec2(8.0, 8.0));
+        assert!(!is_in_drag_area(egui::pos2(4.0, 4.0), floating, NO_TABS), "in the margin");
+        assert!(is_in_drag_area(egui::pos2(400.0, 20.0), floating, NO_TABS));
+        assert!(!is_in_drag_area(egui::pos2(808.0 - 10.0, 20.0), floating, NO_TABS), "controls");
+    }
+
+    #[test]
+    fn a_hidden_chrome_never_drags() {
+        // While the chrome is hidden the page is under the pointer, and a press
+        // at the top of the page must not start moving the window.
+        assert!(!is_in_drag_area(egui::pos2(400.0, 10.0), Rect::NOTHING, NO_TABS));
     }
 }

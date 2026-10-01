@@ -1798,6 +1798,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "euclid",
+ "http",
  "log",
  "rustls",
  "servo",

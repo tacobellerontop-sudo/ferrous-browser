@@ -35,11 +35,13 @@ use servo::{
     DeviceIndependentPixel, DevicePixel, EventLoopWaker, InputEvent, LoadStatus, RenderingContext,
     Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
+use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::browser_state::{BrowserState, TabEvent};
+use crate::homepage;
 use crate::tab::TabId;
 
 /// Owns the Servo instance and one `WebView` per tab.
@@ -222,8 +224,16 @@ impl WebEngine {
         state: Rc<BrowserState>,
         waker: Box<dyn EventLoopWaker>,
     ) -> Self {
+        // `ferrous:` pages (the homepage) are served from the binary. Servo
+        // merges this registry with its own `data:`/`blob:`/`file:` handlers.
+        let mut protocols = ProtocolRegistry::default();
+        protocols
+            .register(homepage::SCHEME, homepage::Protocol)
+            .expect("ferrous: is not a scheme Servo reserves");
+
         let servo = ServoBuilder::default()
             .preferences(crate::prefs::web_compat())
+            .protocol_registry(protocols)
             .event_loop_waker(waker)
             .build();
         servo.setup_logging();
@@ -352,6 +362,7 @@ impl WebViewDelegate for TabDelegate {
     fn notify_new_frame_ready(&self, _webview: WebView) {
         // Painting only when the engine says there is something new keeps idle
         // CPU near zero. URL and title callbacks do NOT prove anything rendered.
+        self.state.mark_needs_paint();
         self.redraw.request();
     }
 

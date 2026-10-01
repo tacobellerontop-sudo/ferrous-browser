@@ -1,7 +1,7 @@
 //! Input translation: winit events to Servo events.
 //!
 //! Pure functions only. Everything here takes values and returns values, with no
-//! reference to the app, the engine or any window handle — which is what makes it
+//! reference to the app, the engine or any window handle â€” which is what makes it
 //! unit testable, and coordinate translation is precisely the kind of thing that
 //! is easy to get subtly wrong.
 //!
@@ -19,6 +19,7 @@ use servo::{
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton as WinitMouseButton};
 use winit::keyboard::Key as WinitKey;
+use winit::keyboard::{NamedKey as WinitNamedKey, PhysicalKey};
 use winit::keyboard::ModifiersState;
 
 /// servoshell uses the same value (ports/servoshell/window.rs:25-27).
@@ -60,7 +61,7 @@ pub fn window_point(position: PhysicalPosition<f64>, ppp: f32) -> egui::Pos2 {
 ///
 /// `keyboard_types::Key` is `enum { Character(String), Named(NamedKey) }` and its
 /// `FromStr` routes through `is_key_string`, which rejects multi-character ASCII
-/// strings — so "Enter" parses to a *named* key rather than a literal character.
+/// strings â€” so "Enter" parses to a *named* key rather than a literal character.
 /// Characters are therefore handled explicitly.
 ///
 /// This is a shortcut. servoshell carries a ~600 line exhaustive match table
@@ -70,16 +71,8 @@ pub fn keyboard_event(
     event: &winit::event::KeyEvent,
     mods: ModifiersState,
 ) -> servo::KeyboardEvent {
-    let key = match &event.logical_key {
-        WinitKey::Character(text) => Key::Character(text.to_string()),
-        other => format!("{other:?}")
-            .parse()
-            .unwrap_or(Key::Named(servo::NamedKey::Unidentified)),
-    };
-
-    let code = format!("{:?}", event.physical_key)
-        .parse::<servo::Code>()
-        .unwrap_or(servo::Code::Unidentified);
+    let key = dom_key(&event.logical_key);
+    let code = dom_code(event.physical_key);
 
     let mut modifiers = Modifiers::empty();
     modifiers.set(Modifiers::CONTROL, mods.control_key());
@@ -101,6 +94,38 @@ pub fn keyboard_event(
     )
 }
 
+/// Translate winit's logical key into the DOM `key` value.
+///
+/// Named keys are matched on the *inner* `NamedKey`. Formatting the whole
+/// `winit::keyboard::Key` with `{:?}` gives `"Named(Enter)"`, which is not a key
+/// name, so every named key used to reach the page as `Unidentified` â€” Enter
+/// could not submit a form and Backspace could not delete. winit names its
+/// variants after the W3C key values, so the inner name parses directly.
+fn dom_key(key: &WinitKey) -> Key {
+    match key {
+        WinitKey::Character(text) => Key::Character(text.to_string()),
+        // The one mismatch that matters: winit treats Space as a named key, but
+        // in the DOM its `key` is the character " ". As `Unidentified` it was
+        // silently dropped from every text field.
+        WinitKey::Named(WinitNamedKey::Space) => Key::Character(" ".to_owned()),
+        WinitKey::Named(named) => format!("{named:?}")
+            .parse::<servo::NamedKey>()
+            .map_or(Key::Named(servo::NamedKey::Unidentified), Key::Named),
+        _ => Key::Named(servo::NamedKey::Unidentified),
+    }
+}
+
+/// Translate winit's physical key into the DOM `code` value, for the same
+/// reason as [`dom_key`]: `{:?}` of the wrapper is `"Code(KeyA)"`, not `"KeyA"`.
+fn dom_code(physical: PhysicalKey) -> servo::Code {
+    match physical {
+        PhysicalKey::Code(code) => format!("{code:?}")
+            .parse()
+            .unwrap_or(servo::Code::Unidentified),
+        PhysicalKey::Unidentified(_) => servo::Code::Unidentified,
+    }
+}
+
 pub fn mouse_button(button: WinitMouseButton) -> MouseButton {
     match button {
         WinitMouseButton::Left => MouseButton::Primary,
@@ -115,6 +140,7 @@ pub fn mouse_button(button: WinitMouseButton) -> MouseButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winit::keyboard::KeyCode;
 
     fn content() -> Rect {
         Rect::from_min_max(egui::pos2(0.0, 60.0), egui::pos2(800.0, 700.0))
@@ -183,5 +209,37 @@ mod tests {
     #[test]
     fn scroll_line_height_matches_servoshell() {
         assert_eq!(SCROLL_LINE_HEIGHT, 76.0);
+    }
+
+    #[test]
+    fn named_keys_reach_the_page_by_name() {
+        // Regression: these all used to arrive as `Unidentified`.
+        for (winit, dom) in [
+            (WinitNamedKey::Enter, servo::NamedKey::Enter),
+            (WinitNamedKey::Backspace, servo::NamedKey::Backspace),
+            (WinitNamedKey::Tab, servo::NamedKey::Tab),
+            (WinitNamedKey::ArrowLeft, servo::NamedKey::ArrowLeft),
+            (WinitNamedKey::Escape, servo::NamedKey::Escape),
+            (WinitNamedKey::Delete, servo::NamedKey::Delete),
+        ] {
+            assert_eq!(dom_key(&WinitKey::Named(winit)), Key::Named(dom));
+        }
+    }
+
+    #[test]
+    fn space_is_a_character_in_the_dom() {
+        assert_eq!(dom_key(&WinitKey::Named(WinitNamedKey::Space)), Key::Character(" ".to_owned()));
+    }
+
+    #[test]
+    fn characters_pass_through() {
+        assert_eq!(dom_key(&WinitKey::Character("a".into())), Key::Character("a".to_owned()));
+    }
+
+    #[test]
+    fn physical_codes_reach_the_page_by_name() {
+        assert_eq!(dom_code(PhysicalKey::Code(KeyCode::KeyA)), servo::Code::KeyA);
+        assert_eq!(dom_code(PhysicalKey::Code(KeyCode::Enter)), servo::Code::Enter);
+        assert_eq!(dom_code(PhysicalKey::Code(KeyCode::Space)), servo::Code::Space);
     }
 }

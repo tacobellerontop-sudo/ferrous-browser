@@ -42,6 +42,9 @@ winit = "0.30.13"
 euclid = "0.22"
 url = "2.5"
 log = "0.4"
+# The built-in homepage's protocol handler sets headers on Servo's `Response`,
+# whose header map is `http`'s. Same major version as servo/Cargo.toml.
+http = "1.4"
 
 # Browser chrome. egui 0.34.3 is not a free choice: servoshell already renders
 # its whole UI with it over Servo's own glow context, and reusing that proven

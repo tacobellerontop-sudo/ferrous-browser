@@ -22,9 +22,10 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::ffi::c_void;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use egui::{LayerId, PaintCallback, Panel, Rect};
+use egui::{LayerId, PaintCallback, Rect};
 use egui_glow::EguiGlow;
 // euclid geometry, aliased so it is not confused with `egui::Rect` — the blit
 // callback needs the integer, bottom-left-origin flavour.
@@ -37,23 +38,30 @@ use servo::{
 };
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey as WinitNamedKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 mod address;
+mod backdrop;
 mod browser_state;
 mod chrome;
 mod engine;
+mod frame_stats;
+mod gpu_fx;
+mod homepage;
 mod icons;
 mod input;
+mod page_mask;
 mod prefs;
 mod scroll;
 mod tab;
+mod theme;
 mod titlebar;
+mod window_state;
 
 use browser_state::BrowserState;
 use chrome::{Action, Chrome};
@@ -61,8 +69,16 @@ use engine::WebEngine;
 use input::{SCROLL_LINE_HEIGHT, keyboard_event, mouse_button, page_point, window_point};
 use scroll::SmoothScroll;
 use tab::{CloseOutcome, TabId};
+use window_state::WindowState;
 
-const START_URL: &str = "https://servo.org";
+const START_URL: &str = homepage::URL;
+
+/// Shortest gap between pointer moves sent to the page, ~120 Hz. Mice report
+/// at up to 1000 Hz, and each move costs Servo a hit test plus any `mousemove`
+/// script and hover restyle — several milliseconds on a page like Wikipedia.
+/// Nothing on screen can update faster than the display anyway; Chrome and
+/// Firefox coalesce moves to the frame rate for the same reason.
+const POINTER_MOVE_INTERVAL: Duration = Duration::from_millis(8);
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Required before any TLS traffic; Servo installs no default provider itself.
@@ -123,6 +139,37 @@ struct AppState {
     /// comparison instead of threading a flag from every navigation site
     /// (toolbar, link click, redirect, history).
     seen_url: RefCell<Option<(String, TabId)>>,
+    /// Where the tab strip sat last frame, so a press there selects a tab
+    /// instead of dragging the window. Tabs share the title-bar row.
+    tab_strip: Cell<Rect>,
+    /// The chrome's title row last frame, or `Rect::NOTHING` while the chrome
+    /// is hidden. Only presses inside it can drag the window.
+    title_row: Cell<Rect>,
+    /// The area the chrome needs pointer moves for (the reveal band, and the
+    /// panel while shown). Moves elsewhere over the page skip egui.
+    pointer_zone: Cell<Rect>,
+    /// Whether the Mica backdrop is on. Without it the window paints an
+    /// opaque background behind the page card instead.
+    translucent: bool,
+    /// Rounds the corners of the page card. See `page_mask`.
+    page_mask: page_mask::PageMask,
+    /// Which tab, at what size, the offscreen framebuffer last received a
+    /// Servo paint for. A frame that changes neither — and has no new Servo
+    /// frame — reuses that image instead of re-rendering the page.
+    painted: Cell<Option<(TabId, u32, u32)>>,
+    /// When egui next wants a frame (a tooltip delay, the caret blink, the tab
+    /// spinner). Written by egui's repaint callback, read in `about_to_wait`.
+    /// `Arc<Mutex<_>>` only because egui requires the callback to be `Send`.
+    repaint_at: Arc<Mutex<Option<Instant>>>,
+    /// The last normal (not maximised, not minimised) window bounds, saved on
+    /// exit. See `window_state`.
+    normal_bounds: Cell<Option<WindowState>>,
+    /// The newest pointer position not yet sent to the page, held back by
+    /// `POINTER_MOVE_INTERVAL`, and when the last one was sent.
+    pending_move: Cell<Option<WebViewPoint>>,
+    last_move_sent: Cell<Instant>,
+    /// Opt-in frame timing (`FERROUS_FRAME_STATS=1`). See `frame_stats`.
+    frame_stats: frame_stats::FrameStats,
     /// Set when the last tab is closed from a shortcut. `handle_shortcut` has no
     /// access to the `ActiveEventLoop` that owns exiting, so the request is
     /// carried up to `window_event`.
@@ -149,16 +196,48 @@ impl ApplicationHandler<WakerEvent> for App {
         let display_handle = event_loop
             .display_handle()
             .expect("event loop must expose a display handle");
+
+        // Reopen where the window was last time, if that is still on a screen.
+        let monitors: Vec<window_state::Monitor> = event_loop
+            .available_monitors()
+            .map(|monitor| {
+                let (position, size) = (monitor.position(), monitor.size());
+                window_state::Monitor {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                }
+            })
+            .collect();
+        let saved = window_state::load().and_then(|state| state.fit_to(&monitors));
+
+        let mut attributes = Window::default_attributes()
+            .with_title("Ferrous")
+            .with_inner_size(PhysicalSize::new(1100, 820))
+            // Logical, so the floor scales with the display like the chrome does.
+            .with_min_inner_size(LogicalSize::new(
+                window_state::MIN_WIDTH,
+                window_state::MIN_HEIGHT,
+            ))
+            // Frameless: `titlebar` draws the bar and supplies the
+            // drag/resize/control behaviour winit is missing.
+            .with_decorations(false)
+            // Lets DWM composite the swap chain's alpha, so the Mica
+            // backdrop shows wherever the frame is cleared to transparent.
+            // See `backdrop`.
+            .with_transparent(true);
+        if let Some(saved) = saved {
+            // Position and size first, then maximise: Windows records the
+            // former as the bounds that "Restore" returns to.
+            attributes = attributes
+                .with_position(PhysicalPosition::new(saved.x, saved.y))
+                .with_inner_size(PhysicalSize::new(saved.width, saved.height))
+                .with_maximized(saved.maximized);
+        }
         let window = Rc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Ferrous")
-                        .with_inner_size(PhysicalSize::new(1100, 820))
-                        // Frameless: `titlebar` draws the bar and supplies the
-                        // drag/resize/control behaviour winit is missing.
-                        .with_decorations(false),
-                )
+                .create_window(attributes)
                 .expect("failed to create window"),
         );
         let window_handle = window
@@ -175,6 +254,9 @@ impl ApplicationHandler<WakerEvent> for App {
             hwnd.get() as *mut c_void
         };
 
+        let translucent = backdrop::enable(hwnd);
+        info!("ferrous: mica backdrop {}", if translucent { "on" } else { "unavailable" });
+
         let window_ctx = Rc::new(
             WindowRenderingContext::new(display_handle, window_handle, window.inner_size())
                 .expect("failed to create rendering context"),
@@ -187,6 +269,26 @@ impl ApplicationHandler<WakerEvent> for App {
             .make_current()
             .expect("failed to make GL context current");
         let egui = EguiGlow::new(event_loop, offscreen_ctx.glow_gl_api(), None, None, false);
+        theme::install(&egui.egui_ctx);
+
+        // egui asks for future frames through this callback (tooltip delays,
+        // caret blink, the tab spinner). `EguiGlow` installs none, so without
+        // it those requests were silently dropped and only happened when some
+        // unrelated event caused a redraw.
+        let repaint_at = Arc::new(Mutex::new(None::<Instant>));
+        {
+            let repaint_at = repaint_at.clone();
+            egui.egui_ctx.set_request_repaint_callback(move |info| {
+                // `checked_add`: egui may pass a huge delay meaning "not soon",
+                // and `Instant + Duration` panics on overflow.
+                let Some(when) = Instant::now().checked_add(info.delay) else {
+                    return;
+                };
+                if let Ok(mut slot) = repaint_at.lock() {
+                    *slot = Some(slot.map_or(when, |earlier| earlier.min(when)));
+                }
+            });
+        }
 
         let state = Rc::new(BrowserState::default());
         let engine = WebEngine::new(
@@ -225,13 +327,73 @@ impl ApplicationHandler<WakerEvent> for App {
             modal_gesture: Cell::new(false),
             cursor: Cell::new(None),
             seen_url: RefCell::new(None),
+            tab_strip: Cell::new(Rect::NOTHING),
+            title_row: Cell::new(Rect::NOTHING),
+            pointer_zone: Cell::new(Rect::NOTHING),
+            translucent,
+            page_mask: page_mask::PageMask::default(),
+            painted: Cell::new(None),
+            repaint_at,
+            normal_bounds: Cell::new(saved.map(|saved| WindowState { maximized: false, ..saved })),
+            pending_move: Cell::new(None),
+            last_move_sent: Cell::new(Instant::now()),
+            frame_stats: frame_stats::FrameStats::from_env(),
             close_requested: Cell::new(false),
         }));
+        if let Self::Running(app) = self {
+            remember_placement(app);
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakerEvent) {
         if let Self::Running(app) = self {
             app.engine.spin();
+        }
+    }
+
+    /// Sleep until egui's next requested frame, or indefinitely if it wants
+    /// none. Never `ControlFlow::Poll`: an idle browser should cost nothing.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Self::Running(app) = self else {
+            return;
+        };
+        let now = Instant::now();
+
+        // A held-back pointer move whose interval has passed goes out now;
+        // otherwise wake up when it is due, so the page always ends up with
+        // the final pointer position even after the mouse stops.
+        let mut wake_at = None;
+        if app.pending_move.get().is_some() {
+            let due = app.last_move_sent.get() + POINTER_MOVE_INTERVAL;
+            if due <= now {
+                flush_pointer_move(app);
+                app.engine.spin();
+            } else {
+                wake_at = Some(due);
+            }
+        }
+
+        if let Ok(mut repaint_at) = app.repaint_at.lock() {
+            match *repaint_at {
+                Some(when) if when <= now => {
+                    *repaint_at = None;
+                    app.window.request_redraw();
+                }
+                Some(when) => wake_at = Some(wake_at.map_or(when, |other: Instant| other.min(when))),
+                None => {}
+            }
+        }
+
+        event_loop.set_control_flow(wake_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+
+    /// Every way of quitting (title-bar close, Alt+F4, closing the last tab)
+    /// ends the event loop, and this runs once when it does — the one place to
+    /// save the window placement.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Self::Running(app) = self {
+            persist_placement(app);
+            app.frame_stats.finish();
         }
     }
 
@@ -249,6 +411,7 @@ impl ApplicationHandler<WakerEvent> for App {
         // embedders end up with a page that has silently stopped responding.
         app.engine.spin();
 
+        let mut quiet_move = false;
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -259,7 +422,24 @@ impl ApplicationHandler<WakerEvent> for App {
                 return;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                app.cursor.set(Some(window_point(position, app.egui.egui_ctx.pixels_per_point())));
+                let point = Some(window_point(position, app.egui.egui_ctx.pixels_per_point()));
+                let previous = app.cursor.replace(point);
+                // A move that starts and ends on the page changes nothing egui
+                // draws, so it needs neither egui nor a frame. Servo still
+                // receives it below, and if the page reacts (a hover style, say)
+                // Servo reports a new frame and that triggers the redraw instead.
+                //
+                // This was the single largest cost in the browser: every mouse
+                // move over a page ran a full chrome layout *and* a full
+                // WebRender repaint.
+                quiet_move = on_page(app, previous)
+                    && on_page(app, point)
+                    && !app.egui.egui_ctx.egui_is_using_pointer();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // Otherwise a pointer that left over the resize border would
+                // keep the resize cursor "armed" for the next frame.
+                app.cursor.set(None);
             }
             // The user can maximise or restore from outside our buttons (Win+Up,
             // dragging the window to a screen edge, double-clicking the bar), so
@@ -270,7 +450,9 @@ impl ApplicationHandler<WakerEvent> for App {
                     app.maximized.set(maximized_now);
                     app.window.request_redraw();
                 }
+                remember_placement(app);
             }
+            WindowEvent::Moved(_) => remember_placement(app),
             WindowEvent::RedrawRequested => {
                 let close_requested = draw_frame(app);
                 app.engine.spin();
@@ -314,13 +496,24 @@ impl ApplicationHandler<WakerEvent> for App {
             }
         }
 
-        let response = app.egui.on_window_event(&app.window, &event);
+        // Quiet moves bypass egui entirely, not just the redraw. egui requests
+        // an immediate repaint after any pass that saw input, so feeding it
+        // every move kept a self-sustaining ~40 fps frame loop running for as
+        // long as the mouse moved, however little changed. egui already knows
+        // the pointer is over the page from the move that brought it there,
+        // and any move that leaves the page goes through the normal path.
+        let (consumed, repaint) = if quiet_move {
+            (false, false)
+        } else {
+            let response = app.egui.on_window_event(&app.window, &event);
+            (response.consumed, response.repaint)
+        };
 
-        if !response.consumed {
+        if !consumed {
             forward_to_page(app, &event);
         }
 
-        if matches!(event, WindowEvent::Resized(_)) || response.repaint {
+        if matches!(event, WindowEvent::Resized(_)) || repaint {
             app.window.request_redraw();
         }
 
@@ -347,6 +540,12 @@ fn draw_frame(app: &mut AppState) -> bool {
     let now = Instant::now();
     let dt = now.duration_since(app.frame_started);
     app.frame_started = now;
+
+    // This frame is happening now, so any earlier "repaint later" request is
+    // satisfied. egui will re-request during the run if it still wants one.
+    if let Ok(mut repaint_at) = app.repaint_at.lock() {
+        *repaint_at = None;
+    }
 
     // Apply engine callbacks before anything reads the tab model. This is the
     // only place the queue is drained, which is what makes it safe: no
@@ -385,33 +584,19 @@ fn draw_frame(app: &mut AppState) -> bool {
         scroll,
         maximized,
         seen_url,
+        tab_strip,
+        title_row,
+        pointer_zone,
+        translucent,
+        page_mask,
+        painted,
+        cursor,
         ..
     } = app;
 
     // `window` is an `Rc<Window>`; deref coercion hands egui the `&Window` it
     // wants without a clone (winit 0.30's Window is not Clone).
     egui.run(&window, |ui| {
-        // Title bar first, so the toolbar panel lays out beneath it and the
-        // content rectangle reported by the chrome ends up below both.
-        //
-        // Zero inner margin is load-bearing: `titlebar::is_in_drag_area` hit
-        // tests against `drag_rect`, which assumes the painted strip starts at
-        // the window origin. With egui's default 8pt margin the two would
-        // disagree by 8pt and presses would land slightly off.
-        let frame = egui::Frame::new()
-            .fill(ui.visuals().panel_fill)
-            .inner_margin(egui::Margin::ZERO)
-            .outer_margin(egui::Margin::ZERO);
-        Panel::top("titlebar").frame(frame).show_inside(ui, |ui| {
-            let page_title = browser.active_tab().title.clone();
-            let label = if page_title.is_empty() {
-                "Ferrous".to_owned()
-            } else {
-                page_title
-            };
-            window_commands.extend(titlebar::draw(ui, &label, maximized.get()));
-        });
-
         // One borrow of the tab set for the whole chrome draw. `BrowserState`
         // holds it behind a `RefCell`, which permits only one borrow at a time,
         // so per-widget borrows would collide — and a borrow held past this block
@@ -419,22 +604,59 @@ fn draw_frame(app: &mut AppState) -> bool {
         //
         // `len` is checked here because this is the one place that would
         // otherwise index into an empty tab set.
+        //
+        // The chrome draws the title bar too, because the tabs live in it.
+        // Title-bar commands are collected here but executed after `present()`;
+        // see `window_commands`.
         let output = {
             let mut tabs = browser.tabs_mut();
             assert!(tabs.len() >= 1, "tab set emptied mid-frame");
-            chrome.draw(ui, &mut tabs)
+            chrome.draw(ui, &mut tabs, maximized.get(), cursor.get())
         };
+        window_commands.extend(output.window_commands);
+        tab_strip.set(output.tab_strip);
+        title_row.set(output.title_row);
+        pointer_zone.set(output.pointer_zone);
+
+        // Without Mica the cleared-to-transparent frame would show whatever
+        // is behind the window, unblurred, so paint a solid background.
+        if !*translucent {
+            ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, theme::BACKDROP_FALLBACK);
+        }
         content_rect.set(Some(output.content_rect));
+
+        // The frameless window's resize border is not a widget, so egui would
+        // show a plain arrow there and nothing would hint the window can be
+        // resized. Set last so it wins over anything the chrome chose.
+        if !maximized.get()
+            && let Some(edge) = cursor
+                .get()
+                .and_then(|point| titlebar::resize_edge_at(point, ui.ctx().content_rect()))
+        {
+            ui.ctx().set_cursor_icon(titlebar::resize_cursor(edge));
+        }
 
         // Whatever the toolbar did not claim belongs to the page.
         let content = output.content_rect;
         let ppp = ui.ctx().pixels_per_point();
         let width = (content.width() * ppp).round().max(1.0) as u32;
         let height = (content.height() * ppp).round().max(1.0) as u32;
-        engine.resize(width, height);
 
-        // Servo renders into the offscreen framebuffer here.
-        engine.paint();
+        // Servo renders into the offscreen framebuffer only when the page has
+        // something new: Servo reported a frame, or the viewport or the active
+        // tab changed. `render` is a full WebRender repaint every time it is
+        // called, and most frames here are chrome-only — a hover, the caret
+        // blinking, a tooltip — which can reuse the image already in the
+        // framebuffer. The blit below still runs every frame.
+        let wanted = (browser.tabs().active().id, width, height);
+        let stale = painted.get() != Some(wanted);
+        if stale {
+            engine.resize(width, height);
+        }
+        if browser.take_needs_paint() || stale {
+            engine.paint();
+            painted.set(Some(wanted));
+        }
 
         // Drop an in-flight glide when the page or the active tab changes.
         // Scrolling the momentum of the page the user just left onto the page
@@ -489,6 +711,8 @@ fn draw_frame(app: &mut AppState) -> bool {
         // Blit the page into the window, underneath everything egui draws. The
         // background layer is painted first, so the toolbar composites on top.
         if let Some(render_to_parent) = offscreen_ctx.render_to_parent_callback() {
+            let page_mask = page_mask.clone();
+            let corner_radius_px = output.content_radius * ppp;
             ui.ctx().layer_painter(LayerId::background()).add(PaintCallback {
                 rect: content,
                 callback: std::sync::Arc::new(egui_glow::CallbackFn::new(
@@ -504,11 +728,24 @@ fn draw_frame(app: &mut AppState) -> bool {
                                 EuclidSize::new(clip.width_px, clip.height_px),
                             ),
                         );
+                        // Then cut the card's rounded corners out of what
+                        // was just blitted, so the backdrop shows through.
+                        page_mask.apply(
+                            painter.gl(),
+                            [clip.left_px, clip.from_bottom_px, clip.width_px, clip.height_px],
+                            corner_radius_px,
+                        );
                     },
                 )),
             });
         }
     });
+
+    // A tab switch or a new tab applied during this frame changes what the
+    // framebuffer should show, so run one more frame to paint it.
+    if !close_window && app.painted.get().map(|(tab, ..)| tab) != Some(app.state.tabs().active().id) {
+        app.window.request_redraw();
+    }
 
     // Keep the loop awake only while a glide is actually in flight. Without this
     // the easing tail would stall; without the `is_animating` guard the browser
@@ -520,8 +757,22 @@ fn draw_frame(app: &mut AppState) -> bool {
 
     // Draw the window surface and swap.
     app.window_ctx.prepare_for_rendering();
+    // egui does not clear, and until now it never needed to: its panels covered
+    // every pixel. With the page as an inset card, everything outside the card
+    // and the chrome must be transparent for the Mica backdrop to show.
+    {
+        use egui_glow::glow::HasContext;
+        let gl = app.window_ctx.glow_gl_api();
+        // SAFETY: plain GL calls on the current context.
+        unsafe {
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(egui_glow::glow::COLOR_BUFFER_BIT);
+        }
+    }
     app.egui.paint(&app.window);
+    let before_present = Instant::now();
     app.window_ctx.present();
+    app.frame_stats.record(now, before_present, Instant::now());
 
     for command in window_commands {
         if apply_window_command(app, command) {
@@ -529,6 +780,56 @@ fn draw_frame(app: &mut AppState) -> bool {
         }
     }
     close_window
+}
+
+/// Whether a pointer position is over the web page itself, clear of the chrome
+/// (including its reveal band at the top) and of the resize border. Pointer
+/// moves within this area need no egui frame.
+fn on_page(app: &AppState, point: Option<egui::Pos2>) -> bool {
+    let (Some(point), Some(content)) = (point, app.content_rect.get()) else {
+        return false;
+    };
+    let on_border = !app.maximized.get()
+        && titlebar::resize_edge_at(point, app.egui.egui_ctx.content_rect()).is_some();
+    content.contains(point) && !app.pointer_zone.get().contains(point) && !on_border
+}
+
+/// Record the window's current bounds as its normal placement, unless it is
+/// maximised or minimised — those are states, not places. See `window_state`.
+fn remember_placement(app: &AppState) {
+    let window = &app.window;
+    if window.is_maximized() || window.is_minimized() == Some(true) {
+        return;
+    }
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let size = window.inner_size();
+    if window_state::is_normal_placement(position.x, position.y, size.width, size.height) {
+        app.normal_bounds.set(Some(WindowState {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+            maximized: false,
+        }));
+    }
+}
+
+/// Write the window placement to disk: the last normal bounds plus whether the
+/// window is maximised now.
+fn persist_placement(app: &AppState) {
+    let Some(bounds) = app.normal_bounds.get() else {
+        return;
+    };
+    let state = WindowState {
+        maximized: app.window.is_maximized(),
+        ..bounds
+    };
+    match window_state::save(state) {
+        Ok(()) => info!("ferrous: saved window placement {state:?}"),
+        Err(err) => error!("ferrous: could not save window placement: {err}"),
+    }
 }
 
 /// Carry out a window (not page) command. None of these block, so unlike the
@@ -541,6 +842,7 @@ fn apply_window_command(app: &AppState, command: titlebar::WindowCommand) -> boo
             let next = !app.maximized.get();
             titlebar::set_maximized(hwnd, next);
             app.maximized.set(next);
+            persist_placement(app);
         }
         titlebar::WindowCommand::Close => return true,
     }
@@ -558,6 +860,11 @@ fn run_modal_gesture<T>(app: &AppState, gesture: impl FnOnce() -> T) -> Option<T
     }
     let result = gesture();
     app.modal_gesture.set(false);
+    // The gesture has ended, so this is the moment the window came to rest:
+    // save now rather than only on exit, so a crash or a killed process does
+    // not lose the placement. One small write per drag, never during it.
+    remember_placement(app);
+    persist_placement(app);
     Some(result)
 }
 
@@ -594,8 +901,7 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
     let Some(pos) = app.cursor.get() else {
         return false;
     };
-    let width = app.egui.egui_ctx.content_rect().width();
-    if !titlebar::is_in_drag_area(pos, width) {
+    if !titlebar::is_in_drag_area(pos, app.title_row.get(), app.tab_strip.get()) {
         return false;
     }
     let hwnd = app.hwnd.get();
@@ -610,7 +916,7 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
 /// window down, which happens only when the last tab is closed.
 fn apply_action(
     engine: &WebEngine,
-    _chrome: &mut Chrome,
+    chrome: &mut Chrome,
     state: &BrowserState,
     action: Action,
 ) -> bool {
@@ -620,10 +926,22 @@ fn apply_action(
             state.note_requested_navigation(url.as_str());
             engine.navigate(url);
         }
-        Action::Back => engine.go_back(),
-        Action::Forward => engine.go_forward(),
-        Action::Reload => engine.reload(),
-        Action::NewTab => open_new_tab(engine, state),
+        Action::Back => {
+            state.note_loading_started();
+            engine.go_back();
+        }
+        Action::Forward => {
+            state.note_loading_started();
+            engine.go_forward();
+        }
+        Action::Reload => {
+            state.note_loading_started();
+            engine.reload();
+        }
+        Action::NewTab => {
+            open_new_tab(engine, state);
+            chrome.request_focus_address_bar();
+        }
         Action::SelectTab(id) => {
             // `select` returns false for a tab that closed between the click and
             // here, which is not an error.
@@ -693,6 +1011,7 @@ fn handle_shortcut(
     if (primary && is_char('r')) || matches!(event.logical_key, WinitKey::Named(WinitNamedKey::F5))
     {
         if pressed {
+            app.state.note_loading_started();
             app.engine.reload();
         }
         return true;
@@ -707,9 +1026,21 @@ fn handle_shortcut(
     };
     if let Some(action) = nav {
         if pressed {
+            // Only when there is somewhere to go: a no-op traversal never
+            // completes, and would leave the tab showing as loading.
+            let (back, forward) = {
+                let tab = app.state.active_tab();
+                (tab.can_go_back, tab.can_go_forward)
+            };
             match action {
-                Action::Back => app.engine.go_back(),
-                Action::Forward => app.engine.go_forward(),
+                Action::Back if back => {
+                    app.state.note_loading_started();
+                    app.engine.go_back();
+                }
+                Action::Forward if forward => {
+                    app.state.note_loading_started();
+                    app.engine.go_forward();
+                }
                 _ => {}
             }
         }
@@ -722,6 +1053,7 @@ fn handle_shortcut(
         if is_char('t') {
             if pressed {
                 open_new_tab(&app.engine, &app.state);
+                app.chrome.request_focus_address_bar();
                 app.window.request_redraw();
             }
             return true;
@@ -758,14 +1090,34 @@ fn last_page_point(app: &AppState) -> WebViewPoint {
     app.last_page_point.get()
 }
 
+/// Send the held-back pointer move, if any, to the page.
+fn flush_pointer_move(app: &AppState) {
+    if let Some(point) = app.pending_move.take() {
+        app.last_move_sent.set(Instant::now());
+        app.engine
+            .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+    }
+}
+
 /// Route an input event to the web page, translating out of the toolbar area.
 fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
+    // Anything else the page receives must come after the pointer reached
+    // where it happened, or a click could land at a stale position.
+    if !matches!(event, WindowEvent::CursorMoved { .. }) {
+        flush_pointer_move(app);
+    }
+
     match event {
         WindowEvent::CursorMoved { position, .. } => {
             let point = page_point(*position, app.egui.egui_ctx.pixels_per_point(), app.content_rect.get());
             app.last_page_point.set(point);
-            app.engine
-                .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+            // Coalesced: only the newest position matters, at most once per
+            // `POINTER_MOVE_INTERVAL`. The remainder is sent from
+            // `about_to_wait` when its interval is up.
+            app.pending_move.set(Some(point));
+            if app.last_move_sent.get().elapsed() >= POINTER_MOVE_INTERVAL {
+                flush_pointer_move(app);
+            }
         }
         WindowEvent::MouseInput { state, button, .. } => {
             app.engine
