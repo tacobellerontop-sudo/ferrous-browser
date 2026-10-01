@@ -13,3 +13,11 @@ linker = "lld-link.exe"
 # not in the default feature set, so this is currently inert. It is replicated
 # for fidelity only and must NOT be extended to cover our own crates.
 RUSTC_BOOTSTRAP = "crown,script,script_webgpu,script_bindings,style_tests,mozjs,mozjs_sys"
+
+# GStreamer for the `media` feature (see browser/Cargo.toml). gstreamer-sys finds
+# it through pkg-config; GStreamer's MSVC packages ship their own pkg-config.exe
+# and relocatable .pc files, so pointing at the unpacked copy is enough. Paths
+# are relative to the project root. Variables already set in the environment
+# win, so a GStreamer installed elsewhere can be used instead.
+PKG_CONFIG = { value = "deps/gstreamer/1.0/msvc_x86_64/bin/pkg-config.exe", relative = true }
+PKG_CONFIG_PATH = { value = "deps/gstreamer/1.0/msvc_x86_64/lib/pkgconfig", relative = true }

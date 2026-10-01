@@ -36,6 +36,15 @@ Required features for our target (Windows + GPU):
 - `no-wgl` — **required on Windows.** Matches `ports/servoshell/Cargo.toml:154`
   and `ffi/capi/Cargo.toml:35`. Expands to ANGLE (`mozangle/egl`,
   `mozangle/build_dlls`) plus `surfman/sm-angle-default`.
+- `media-gstreamer`, through our default `media` feature (accepted 2026-10-01
+  when the user asked for media). Without it Servo uses its dummy backend and
+  no `<video>`/`<audio>` plays. Needs GStreamer 1.22.8 (MSVC x86_64), the
+  version `mach bootstrap` uses. `scripts/fetch-gstreamer.ps1` unpacks Servo's
+  copies of the packages into `deps/gstreamer` with `msiexec /a`, so there is
+  no UAC prompt and no system install. `scripts/copy-gstreamer-dlls.ps1` stages
+  the DLLs and plugins next to the executable, which will not start without
+  them. Build with `--no-default-features` to go without. It does **not**
+  provide `MediaSource`, so YouTube still cannot play.
 - Keep Servo's defaults (`bundled`, `clipboard`, `js_jit`, `multiprocess`) for
   now. Trimming features is a measured decision, not a guess.
 
@@ -178,7 +187,6 @@ an async runtime to the app would duplicate a runtime we do not own.
 | `accesskit` + `egui-winit/accesskit` | browser-chrome accessibility | Milestone 5 (perf/measure) or an explicit a11y requirement |
 | `image` | favicon decoding | servoshell decodes favicons itself (`desktop/gui.rs:842-866`). Reuse the same approach rather than adding a dependency — `image` is already in the graph, so the cost is nil either way. Decide with Milestone 3 (tabs need favicons). |
 | persistence format (JSON / SQLite / `rusqlite`) | history, bookmarks, session restore | Milestone 4. Note the brief flags database access cost as a perf concern. |
-| `servo/media-gstreamer` | audio/video/WebRTC | Requires a native GStreamer install and MSI-based bootstrap with UAC elevation on Windows. Not worth it for a lightweight first browser. Revisit only if media is requested. |
 | `servo/webxr` | WebXR | servoshell enables it by default; we do not need it initially. Adds a real dependency. |
 | `servo/background-hang_monitor` | diagnosing hangs | dev-only; consider a feature flag |
 | `egui-file-dialog` | file pickers | Milestone 4 (downloads), if native file dialogs are needed |

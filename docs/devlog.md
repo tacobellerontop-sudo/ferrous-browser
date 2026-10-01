@@ -1426,3 +1426,88 @@ several times.
   the loading spinner.
 - When scrolled, the masthead background is see-through.
 - After an SPA search, the search-button icon is blank.
+
+---
+
+## 2026-10-01 — Entry 014: Audio and video through GStreamer (user-requested)
+
+Until now Ferrous built Servo without `media-gstreamer`, so Servo used its dummy
+media backend and no `<video>` or `<audio>` played anywhere. It was deferred
+because `mach bootstrap` installs GStreamer through MSIs with UAC elevation
+(`docs/dependencies.md`). The user asked for media, so it is now a default
+`media` feature.
+
+### What changed
+
+- `browser/Cargo.toml`: feature `media = ["servo/media-gstreamer"]`, in
+  `default`. `--no-default-features` builds without it. That build was not
+  re-run after this change.
+- `scripts/fetch-gstreamer.ps1`: downloads GStreamer 1.22.8 MSVC x86_64,
+  runtime and devel, from `servo/servo-build-deps`. These are the packages
+  `mach bootstrap` uses (`servo/python/servo/platform/windows.py:27-28`).
+  It checks the size and SHA-256, then runs `msiexec /a` into
+  `deps/gstreamer/1.0/msvc_x86_64` (gitignored).
+- `.cargo/config.toml`: `PKG_CONFIG` and `PKG_CONFIG_PATH` point at that
+  folder, relative to the project root. GStreamer's MSVC packages ship their
+  own `pkg-config.exe` and relocatable `.pc` files
+  (`prefix=${pcfiledir}/../..`), so nothing else is needed. Environment
+  variables already set take precedence.
+- `scripts/copy-gstreamer-dlls.ps1`: copies 50 libraries and 36 plugins next to
+  the executable. It reads both lists from the pinned Servo checkout
+  (`python/servo/gstreamer.py`, `components/servo/gstreamer_plugin_lists/`),
+  so it cannot drift from what that Servo revision loads.
+- CI: fetches GStreamer before building, stages the DLLs after, and uploads
+  every DLL with the binary.
+- `Cargo.lock`: 39 new package versions, all identical to `servo/Cargo.lock`.
+
+### Problems and decisions
+
+**No elevation needed.** `mach` runs `msiexec /a` through
+`Start-Process -Verb runAs`. An administrative install only unpacks files, and
+into a user-writable folder it succeeded without UAC (exit 0 for both
+packages). Nothing is registered with Windows and `PATH` is untouched.
+
+**The packages cannot be checked against GStreamer.** GStreamer no longer hosts
+1.22.8 (the 1.22 series on gstreamer.freedesktop.org starts at 1.22.12). The
+MSIs are not code-signed, and GitHub recorded no digest for these assets
+(uploaded 2024-01-03, before it did). Their provenance is Servo's own release,
+the same files Servo's tooling fetches. The fetch script pins the size and
+SHA-256 measured on first download, so a different file is rejected.
+
+**The DLL copy is mandatory.** The executable imports GStreamer DLLs, so Windows
+will not start it without them. Servo also loads each listed plugin from the
+executable's directory and calls `std::process::exit(1)` if GStreamer fails to
+initialise (`components/servo/servo.rs`, `media_platform::init`). Run
+`scripts/copy-gstreamer-dlls.ps1` after any build into a fresh target directory,
+just like `copy-angle-dlls.ps1`. `cargo test` was unaffected: 146 pass.
+
+**Build cost.** Switching the feature on recompiled a broad set of crates
+through feature unification: 9 min 57 s on this machine. `deps/gstreamer` is
+1.2 GB unpacked.
+
+### Verified on screen
+
+A local test page with MDN's CC0 sample media
+(`interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.{webm,mp4}`,
+`cc0-audio/t-rex-roar.mp3`):
+
+| Item | Result |
+| --- | --- |
+| WebM (VP9), autoplay muted loop | plays: readyState 4, 960x540, time advancing, picture on screen |
+| MP4 (H.264/AAC), autoplay muted loop | same |
+| MP3, play pressed with a real click | plays: `paused=false`, time 1.01 of 2.07 s |
+| `canPlayType` | VP9, VP8/Vorbis, H.264/AAC: "probably"; `audio/mpeg`: "maybe"; Ogg Opus: "" |
+| `MediaSource` | still `undefined` |
+
+Audio reaching the speakers could not be confirmed from a screenshot. The
+element's clock advances, which needs a working pipeline, and no GStreamer
+errors were logged.
+
+### Not working
+
+- **YouTube still cannot play.** It serves only MSE (`MediaSource`) streams, and
+  Servo has no `MediaSource` in any build. This feature does not change that.
+- Servo's built-in audio controls show `00:00 / 00:00` while playing, though
+  `currentTime` advances.
+- `canPlayType('audio/ogg; codecs="opus"')` returns `""` although the `gstopus`
+  and `gstogg` plugins are staged. Not investigated.

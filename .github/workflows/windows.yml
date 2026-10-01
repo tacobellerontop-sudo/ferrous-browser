@@ -9,7 +9,10 @@ name: Windows
 #   2. libEGL.dll / libGLESv2.dll copied next to the executable, because we use
 #      Servo's `no-wgl` feature (ANGLE) on Windows.
 #
-# Both were found the hard way: our local build only worked because someone had
+# The default `media` feature adds a third: GStreamer, unpacked into deps/ to
+# build and its DLLs and plugins copied next to the executable to run.
+#
+# The first two were found the hard way: our local build only worked because someone had
 # already run `mach bootstrap` on this machine. This workflow builds from a
 # clean checkout so that gap cannot silently return.
 #
@@ -79,6 +82,12 @@ jobs:
         working-directory: servo
         run: .\mach.ps1 fetch
 
+      # The `media` feature links against GStreamer, found through pkg-config
+      # (.cargo/config.toml points it at deps/gstreamer).
+      - name: Fetch GStreamer
+        shell: pwsh
+        run: .\scripts\fetch-gstreamer.ps1
+
       # `medium` is defined in browser/Cargo.toml and mirrors Servo's profile:
       # dev-like but optimised, with line-tables-only debug info. Full `dev`
       # debug info makes a Servo target directory enormous.
@@ -91,6 +100,12 @@ jobs:
       - name: Stage ANGLE runtime DLLs
         shell: pwsh
         run: .\scripts\copy-angle-dlls.ps1
+
+      # The binary imports GStreamer DLLs, and Servo loads its plugins from the
+      # executable's directory. See scripts/copy-gstreamer-dlls.ps1.
+      - name: Stage GStreamer DLLs and plugins
+        shell: pwsh
+        run: .\scripts\copy-gstreamer-dlls.ps1
 
       - name: Verify the binary starts
         shell: pwsh
@@ -109,7 +124,6 @@ jobs:
           name: ferrous-browser-windows
           path: |
             browser/target/medium/ferrous-browser.exe
-            browser/target/medium/libEGL.dll
-            browser/target/medium/libGLESv2.dll
+            browser/target/medium/*.dll
           retention-days: 7
           if-no-files-found: error

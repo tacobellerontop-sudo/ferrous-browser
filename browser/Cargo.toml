@@ -29,6 +29,16 @@ publish = false
 name = "ferrous-browser"
 path = "src/main.rs"
 
+[features]
+default = ["media"]
+# Audio and video through GStreamer. Without it Servo uses its dummy media
+# backend and no <video> or <audio> ever plays. Needs GStreamer 1.22 unpacked
+# into `deps/gstreamer` (scripts/fetch-gstreamer.ps1) to build, and its DLLs
+# next to the executable (scripts/copy-gstreamer-dlls.ps1) to start: the
+# binary links against them, so it will not even load without them.
+# Build with `--no-default-features` to go without.
+media = ["servo/media-gstreamer"]
+
 [dependencies]
 # Servo is an ENGINE dependency: a path dependency on our pinned checkout, so we
 # get the exact revision recorded in docs/servo-version.md rather than whatever
