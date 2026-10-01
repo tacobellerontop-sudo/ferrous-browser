@@ -173,6 +173,8 @@ struct AppState {
     /// `POINTER_MOVE_INTERVAL`, and when the last one was sent.
     pending_move: Cell<Option<WebViewPoint>>,
     last_move_sent: Cell<Instant>,
+    /// Who the system input method was last given to. See `arbitrate_ime`.
+    ime_owner: Cell<ImeOwner>,
     /// Opt-in frame timing (`FERROUS_FRAME_STATS=1`). See `frame_stats`.
     frame_stats: frame_stats::FrameStats,
     /// The session as last written, and when, for debounced saving.
@@ -371,6 +373,7 @@ impl ApplicationHandler<WakerEvent> for App {
             normal_bounds: Cell::new(saved.map(|saved| WindowState { maximized: false, ..saved })),
             pending_move: Cell::new(None),
             last_move_sent: Cell::new(Instant::now()),
+            ime_owner: Cell::new(ImeOwner::Nobody),
             frame_stats: frame_stats::FrameStats::from_env(),
             saved_session: RefCell::new(None),
             last_persist: Cell::new(Instant::now()),
@@ -779,6 +782,8 @@ fn draw_frame(app: &mut AppState) -> bool {
         }
     });
 
+    arbitrate_ime(app);
+
     // A tab switch or a new tab applied during this frame changes what the
     // framebuffer should show, so run one more frame to paint it.
     if !close_window && app.painted.get().map(|(tab, ..)| tab) != Some(app.state.tabs().active().id) {
@@ -948,6 +953,54 @@ fn begin_title_bar_drag(app: &AppState) -> bool {
         unsafe { titlebar::drag_title_bar(hwnd) };
     });
     true
+}
+
+/// Who should receive input-method (IME) text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImeOwner {
+    Nobody,
+    /// The address bar; egui drives the IME itself.
+    Chrome,
+    /// A page text field, at this window-pixel rectangle.
+    Page([i32; 4]),
+}
+
+/// Give the system input method to whoever needs it.
+///
+/// The address bar (egui) and the page (Servo) share one OS IME. egui switches
+/// it only on changes of its own focus, so after an address-bar edit it turns
+/// the IME *off*, even if a page field has just taken focus. Running after
+/// egui's turn every frame, and acting only when the owner changes, means the
+/// page reliably gets it back without calling into Windows on every frame.
+fn arbitrate_ime(app: &AppState) {
+    let owner = if app.state.address_focused.get() {
+        ImeOwner::Chrome
+    } else if let (Some(area), Some(content)) = (app.engine.page_ime_area(), app.content_rect.get()) {
+        // The field's rectangle is relative to the page; the page starts at the
+        // card's top-left, in physical pixels.
+        let ppp = app.egui.egui_ctx.pixels_per_point();
+        let x = (content.min.x * ppp).round() as i32 + area[0];
+        let y = (content.min.y * ppp).round() as i32 + area[1];
+        ImeOwner::Page([x, y, area[2], area[3]])
+    } else {
+        ImeOwner::Nobody
+    };
+    if owner == app.ime_owner.replace(owner) {
+        return;
+    }
+    match owner {
+        ImeOwner::Page([x, y, width, height]) => {
+            app.window.set_ime_allowed(true);
+            app.window.set_ime_cursor_area(
+                PhysicalPosition::new(x, y),
+                PhysicalSize::new(width.max(1) as u32, height.max(1) as u32),
+            );
+            info!("ime: page field at {x},{y} {width}x{height}");
+        }
+        ImeOwner::Nobody => app.window.set_ime_allowed(false),
+        // egui has already set it up for the address bar.
+        ImeOwner::Chrome => {}
+    }
 }
 
 /// Bring tab `id` to the front, creating its web view first if it was restored
@@ -1293,6 +1346,13 @@ fn forward_to_page(app: &mut AppState, event: &WindowEvent) {
             let mods = app.modifiers.get();
             app.engine
                 .notify_input_event(InputEvent::Keyboard(keyboard_event(event, mods)));
+        }
+        WindowEvent::Ime(ime) => {
+            // The address bar's IME input is egui's; only the page's comes here.
+            if app.state.address_focused.get() {
+                return;
+            }
+            app.engine.notify_ime(ime);
         }
         _ => {}
     }

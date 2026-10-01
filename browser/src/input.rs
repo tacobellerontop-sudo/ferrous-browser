@@ -17,7 +17,7 @@ use servo::{
     DevicePoint, Key, KeyState, Location, Modifiers, MouseButton, WebViewPoint,
 };
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton as WinitMouseButton};
+use winit::event::{ElementState, Ime, MouseButton as WinitMouseButton};
 use winit::keyboard::Key as WinitKey;
 use winit::keyboard::{NamedKey as WinitNamedKey, PhysicalKey};
 use winit::keyboard::ModifiersState;
@@ -137,6 +137,23 @@ pub fn mouse_button(button: WinitMouseButton) -> MouseButton {
     }
 }
 
+/// Translate an IME event for the page.
+///
+/// Enabled, preedit and commit become the start, update and end of a DOM
+/// composition, which is what makes CJK input appear in a page's text field.
+/// `Disabled` maps to nothing here: whether it means "the user dismissed the
+/// IME" or "we turned it off ourselves" depends on state only the caller has.
+/// Mirrors servoshell's handling (ports/servoshell/desktop/headed_window.rs).
+pub fn composition_event(ime: &Ime) -> Option<servo::ImeEvent> {
+    let (state, data) = match ime {
+        Ime::Enabled => (servo::CompositionState::Start, String::new()),
+        Ime::Preedit(text, _) => (servo::CompositionState::Update, text.clone()),
+        Ime::Commit(text) => (servo::CompositionState::End, text.clone()),
+        Ime::Disabled => return None,
+    };
+    Some(servo::ImeEvent::Composition(servo::CompositionEvent { state, data }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +258,30 @@ mod tests {
         assert_eq!(dom_code(PhysicalKey::Code(KeyCode::KeyA)), servo::Code::KeyA);
         assert_eq!(dom_code(PhysicalKey::Code(KeyCode::Enter)), servo::Code::Enter);
         assert_eq!(dom_code(PhysicalKey::Code(KeyCode::Space)), servo::Code::Space);
+    }
+
+    fn composition(ime: Ime) -> (servo::CompositionState, String) {
+        match composition_event(&ime) {
+            Some(servo::ImeEvent::Composition(c)) => (c.state, c.data),
+            other => panic!("expected a composition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ime_composition_maps_start_update_end() {
+        assert_eq!(composition(Ime::Enabled), (servo::CompositionState::Start, String::new()));
+        assert_eq!(
+            composition(Ime::Preedit("にほ".into(), Some((0, 6)))),
+            (servo::CompositionState::Update, "にほ".to_owned())
+        );
+        assert_eq!(
+            composition(Ime::Commit("日本".into())),
+            (servo::CompositionState::End, "日本".to_owned())
+        );
+    }
+
+    #[test]
+    fn ime_disabled_is_left_to_the_caller() {
+        assert!(composition_event(&Ime::Disabled).is_none());
     }
 }

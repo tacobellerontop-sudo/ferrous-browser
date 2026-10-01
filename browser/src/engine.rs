@@ -25,7 +25,7 @@
 //! `set_throttled` does not exist in this version — it was removed — so hiding is
 //! the only lever for making a background tab cheap.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -33,7 +33,7 @@ use euclid::Scale;
 use log::info;
 use servo::{
     DeviceIndependentPixel, DevicePixel, EventLoopWaker, Image, InputEvent, LoadStatus, PixelFormat,
-    RenderingContext, WebResourceLoad, WebResourceResponse,
+    EmbedderControl, EmbedderControlId, RenderingContext, WebResourceLoad, WebResourceResponse,
     Scroll, Servo, ServoBuilder, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
 use servo::protocol_handler::ProtocolRegistry;
@@ -201,8 +201,18 @@ impl Engine {
 /// Split out from [`Engine`] because `open_tab` needs the rendering context, the
 /// shared state and the window, while the rest of the engine does not. Keeping
 /// them here means `Engine` stays a plain struct that a `RefCell` can own.
+/// A page text field that has asked for the system input method, and where it
+/// is: device pixels, relative to the page.
+#[derive(Debug, Clone, Copy)]
+struct PageIme {
+    id: EmbedderControlId,
+    area: [i32; 4],
+}
+
 pub struct WebEngine {
     engine: RefCell<Engine>,
+    /// Shared with every tab's delegate, which sets and clears it.
+    page_ime: Rc<Cell<Option<PageIme>>>,
     rendering_context: Rc<dyn RenderingContext>,
     state: Rc<BrowserState>,
     window: Rc<Window>,
@@ -246,6 +256,7 @@ impl WebEngine {
                 webviews: RefCell::new(HashMap::new()),
                 active: RefCell::new(None),
             }),
+            page_ime: Rc::new(Cell::new(None)),
             rendering_context,
             state,
             window,
@@ -267,6 +278,7 @@ impl WebEngine {
                     state: self.state.clone(),
                     redraw: RedrawRequest(self.window.clone()),
                     tab,
+                    page_ime: self.page_ime.clone(),
                 }))
                 .build()
         };
@@ -312,6 +324,27 @@ impl WebEngine {
 
     pub fn paint(&self) {
         self.engine.borrow().paint();
+    }
+
+    /// Where the page's focused text field is, `[x, y, width, height]` in device
+    /// pixels relative to the page, while it wants the system input method.
+    pub fn page_ime_area(&self) -> Option<[i32; 4]> {
+        self.page_ime.get().map(|ime| ime.area)
+    }
+
+    /// Forward an IME event to the page.
+    ///
+    /// `Ime::Disabled` arrives both when the user dismisses the IME and when
+    /// the browser turns it off itself (focus moved on). Only the first should
+    /// reach the page, as a dismissal that blurs the field; servoshell makes
+    /// the same distinction by whether an input method is still expected.
+    pub fn notify_ime(&self, ime: &winit::event::Ime) {
+        let event = match crate::input::composition_event(ime) {
+            Some(event) => event,
+            None if self.page_ime.take().is_some() => servo::ImeEvent::Dismissed,
+            None => return,
+        };
+        self.notify_input_event(InputEvent::Ime(event));
     }
 
     /// Whether `tab` already has a web view. Tabs restored from the last session
@@ -370,6 +403,7 @@ struct TabDelegate {
     state: Rc<BrowserState>,
     redraw: RedrawRequest,
     tab: TabId,
+    page_ime: Rc<Cell<Option<PageIme>>>,
 }
 
 impl WebViewDelegate for TabDelegate {
@@ -392,6 +426,26 @@ impl WebViewDelegate for TabDelegate {
             let url = request.url.clone();
             load.intercept(WebResourceResponse::new(url)).cancel();
             self.state.push_event(TabEvent::RequestBlocked { tab: self.tab });
+            self.redraw.request();
+        }
+    }
+
+    /// A page text field took focus and wants the system input method. Other
+    /// controls (select pickers, dialogs) are left to their defaults for now.
+    fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
+        if let EmbedderControl::InputMethod(input) = control {
+            let rect = input.position();
+            self.page_ime.set(Some(PageIme {
+                id: input.id(),
+                area: [rect.min.x, rect.min.y, rect.width(), rect.height()],
+            }));
+            self.redraw.request();
+        }
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, id: EmbedderControlId) {
+        if self.page_ime.get().is_some_and(|ime| ime.id == id) {
+            self.page_ime.set(None);
             self.redraw.request();
         }
     }
